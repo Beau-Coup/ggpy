@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ggpy"
+version = "0.1.0"
+description = 'A package for correct Gaussian Processes'
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = []
+authors = [
+  { name = "ab", email = "48172047+Beau-Coup@users.noreply.github.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy~=1.26",
+    "scipy~=1.13",
+]
+
+[project.urls]
+Documentation = "https://github.com/ab/ggpy#readme"
+Issues = "https://github.com/ab/ggpy/issues"
+Source = "https://github.com/ab/ggpy"
+
+[tool.hatch.envs.types]
+extra-dependencies = [
+  "mypy>=1.0.0",
+]
+[tool.hatch.envs.types.scripts]
+check = "mypy --install-types --non-interactive {args:src/ggpy tests}"
+
+[tool.coverage.run]
+source_pkgs = ["ggpy", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/ggpy/__about__.py",
+]
+
+[tool.coverage.paths]
+ggpy = ["src/ggpy", "*/ggpy/src/ggpy"]
+tests = ["tests", "*/ggpy/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
