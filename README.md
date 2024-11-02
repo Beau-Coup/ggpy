@@ -1,19 +1,28 @@
 # ggpy
 
-[![PyPI - Version](https://img.shields.io/pypi/v/ggpy.svg)](https://pypi.org/project/ggpy)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/ggpy.svg)](https://pypi.org/project/ggpy)
+![Static Badge](https://img.shields.io/badge/Version-0.1.0-blue?style=for-the-badge)
+![Static Badge](https://img.shields.io/badge/Python-3.9-blue?style=for-the-badge)
+
+A Gaussian Process package for Python, written in Python.  
 
 -----
 
 ## Table of Contents
 
+- [Features](#features)
 - [Installation](#installation)
 - [License](#license)
+
+## Features 
+- Heteroscedastic kernels
+- Augmented kernels
+- Parameter optimization
+- Noisy-input regression [WIP]
 
 ## Installation
 
 ```console
-pip install ggpy
+pip install git+https://github.com/Beau-Coup/ggpy
 ```
 
 ## License

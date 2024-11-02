@@ -1,6 +1,9 @@
 import numpy as np
-import scipy.optimize as opt
 import scipy.linalg as sla
+import scipy.optimize as opt
+from numpy.typing import NDArray
+
+from . import fourier
 
 
 class Kernel:
@@ -85,7 +88,73 @@ class Kernel:
         return LinearAugment(self, A, noise)
 
 
-class RBF(Kernel):
+class Stationary(Kernel):
+    """Kernels that depend only on x1 - x2 implement this.
+
+    This allows for drawing random samples more efficiently.
+    See the Wiener-Khinchin theorem.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def power_spectrum(self, k: float | NDArray) -> float | NDArray:
+        raise NotImplementedError
+
+    def sample_prior(
+        self, n_points: int, length: float, seed: int | None = None
+    ) -> NDArray:
+        """Generate a random sample from the prior.
+
+        I am not sure this method actually produces a sample with the right properties, but it looks good enough.
+
+        Parameters
+        ----------
+        n_points : int
+            The number of points to sample use as the grid.
+        length : float
+            The width of the sample in spatial coordinates.
+            Sample interval on [-size / 2, size /2].
+
+        Returns
+        -------
+        ndarray ((n_points,) * input_dims + (output_dims,))
+            The generated sample.
+        """
+
+        center = (n_points - 1) / 2.0
+        x = np.arange(n_points)
+        y = np.arange(n_points)
+
+        x, y = np.meshgrid(x, y)
+        k = np.hypot(x - center, y - center) * 2 / length
+
+        grid = length**2 * self.power_spectrum(k)
+        half = int(n_points / 2)
+
+        aj = np.zeros((n_points, n_points), dtype=np.complex128)
+        # We are generating the right half of the noise
+        if seed is not None:
+            np.random.seed(seed)
+
+        aj[:, half:] = np.random.randn(n_points, half) + (
+            np.random.randn(n_points, half) * 1j
+        )
+        # We want [-x, -y] = conj(x, y)
+        aj[:, :half] = np.conj(aj[-1::-1, -1 : half - 1 : -1])
+
+        aj *= grid / 2
+
+        out = fourier.ifft2_v(aj)  # Unnormalized
+
+        assert np.allclose(
+            np.zeros((n_points, n_points)), np.imag(out), atol=1e-10, rtol=1e-08
+        )
+        out = np.real(out)
+        return out / length
+
+
+class RBF(Stationary):
     """Do I want to optimize over the hyperparameters?
     Why not try?
     """
@@ -100,7 +169,6 @@ class RBF(Kernel):
         Parameters:
             x1: (n x self.input_dims) matrix of input points
             x2: (m x self.input_dims) matrix of input points
-            full_size: bool, whether or not to return the whole covariance, or only the non-zeros
 
         Returns:
             k(x1, x2): (out_dims * n) x (out_dims * m) matrix of pairwise kernel computations, i.e. the covariance
@@ -142,6 +210,35 @@ class RBF(Kernel):
         dk = -dx / self.hyper_params[0] ** 2  # n x input_dims x m
         k = self.eval(x1, x2)  # n x m
         return dk * k[:, None, :]
+
+    def length_scale(self) -> float:
+        """Return the fit length scale of the kernel."""
+        return self.hyper_params[0]
+
+    def noise(self) -> float:
+        """Return the fit noise value of the kernel."""
+        return self.hyper_params[1]
+
+    def power_spectrum(self, k: float | NDArray) -> float | NDArray:
+        """Return the power spectrum of the kernel at a particular wave number.
+
+        Given Wiener-Khinchin, this is the same as the Fourier Transform of the kernel.
+
+        Parameters
+        ----------
+        k : float | NDArray
+            The wave number(s) at which to evaluate the power spectrum.
+
+        Ruturns
+        -------
+        float | NDArray
+            The power of the given wave number(s).
+        """
+        return (
+            np.sqrt(2 * np.pi)
+            * self.hyper_params[0]
+            * np.exp(-2 * ((np.pi * k * self.hyper_params[0]) ** 2))
+        )
 
 
 class LinearAugment:

@@ -30,27 +30,7 @@ class GP:
     def fit(self):
         # self.kernel.optimize(self.train_inputs, self.train_outputs)
         # Perform fit steps until convergence
-        if self.cho is None:
-            self.fit_step()
-        assert self.cho is not None
-
-        count = 0
-        while True:
-            old_cho = self.cho.copy()
-            self.fit_step()
-            count += 1
-            if ((old_cho - self.cho) ** 2).sum() < 1e-6:
-                break
-
-    def fit_step(self):
         k = self.kernel.eval(self.train_inputs)
-        # if self.cho is not None:
-        #     grad_k = self.kernel.gradient(self.train_inputs, self.train_inputs)
-        #     x_nom = sla.cho_solve((self.cho, False), self.train_outputs)
-        #     grad = grad_k @ x_nom
-        #     g = self.input_noise * grad @ grad.T
-        #     k += g
-
         self.cho = sla.cholesky(k)
 
     def cho_add_column(self, _):
@@ -75,16 +55,48 @@ class GP:
             self.kernel.input_dims,
         ), f"Expected xs to be (n, {self.kernel.input_dims}), got {xs.shape}"
 
+        if self.cho is None:
+            ys = np.zeros((xs.shape[0], self.kernel.output_dims))
+            if var:
+                css = self.kernel.eval(xs, xs)
+                return (ys, css)
+            else:
+                return ys
+
         ps = sla.cho_solve((self.cho, False), self.train_outputs.reshape((-1)))
         cov = self.kernel.eval(xs, self.train_inputs)
-
         ys = (cov @ ps).reshape((xs.shape[0], self.kernel.output_dims))
+
         if var:
             css = self.kernel.eval(xs, xs)
             pss = sla.cho_solve((self.cho, False), cov.T)
             return (ys, css - cov @ pss)
 
         return ys
+
+    def sample(self, xs: NDArray) -> NDArray:
+        """Draw a sample from the posterior distribution.
+
+        This is an expensive function for many points, use Stationary.sample_prior if possible.
+
+        Parameters
+        ----------
+        xs : NDArray (n, input_dims)
+            The points at which to sample.
+
+        Returns
+        -------
+        NDArray (n, output_dims)
+            Values of f(x) of random sample from the posterior evaluated at each x in xs.
+
+        """
+        mean, var = self.predict(xs, var=True)
+        cov_cho = sla.cholesky(
+            var + 1e-10 * np.identity(var.shape[0]), lower=True
+        )  # Stable my numerical
+
+        entropy = np.random.rand(cov_cho.shape[1])
+        return mean + (cov_cho @ entropy).reshape(mean.shape)
 
     def variance(self, xs):
         cov = self.kernel.eval(xs, self.train_inputs)
