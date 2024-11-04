@@ -91,12 +91,7 @@ class GP:
 
         """
         mean, var = self.predict(xs, var=True)
-        cov_cho = sla.cholesky(
-            var + 1e-10 * np.identity(var.shape[0]), lower=True
-        )  # Stable my numerical
-
-        entropy = np.random.rand(cov_cho.shape[1])
-        return mean + (cov_cho @ entropy).reshape(mean.shape)
+        return np.random.multivariate_normal(mean.flatten(), var)
 
     def variance(self, xs):
         cov = self.kernel.eval(xs, self.train_inputs)

@@ -127,9 +127,15 @@ class Stationary(Kernel):
         y = np.arange(n_points)
 
         x, y = np.meshgrid(x, y)
-        k = np.hypot(x - center, y - center) * 2 / length
+        k = (
+            np.hypot(x - center, y - center)
+            * (n_points - 1)
+            / length
+            / n_points
+            / np.sqrt(2)
+        )
 
-        grid = length**2 * self.power_spectrum(k)
+        grid = self.power_spectrum(k) * length * np.sqrt(2)
         half = int(n_points / 2)
 
         aj = np.zeros((n_points, n_points), dtype=np.complex128)
@@ -145,13 +151,13 @@ class Stationary(Kernel):
 
         aj *= grid / 2
 
-        out = fourier.ifft2_v(aj)  # Unnormalized
+        out = fourier.ifft2_v(aj) / length / length  # Unnormalized
 
         assert np.allclose(
             np.zeros((n_points, n_points)), np.imag(out), atol=1e-10, rtol=1e-08
         )
         out = np.real(out)
-        return out / length
+        return out
 
 
 class RBF(Stationary):
