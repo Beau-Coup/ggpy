@@ -31,7 +31,7 @@ class GP:
         # self.kernel.optimize(self.train_inputs, self.train_outputs)
         # Perform fit steps until convergence
         k = self.kernel.eval(self.train_inputs)
-        self.cho = sla.cholesky(k)
+        self.cho = sla.cholesky(k + np.identity(k.shape[0]) * 1e-10)
 
     def cho_add_column(self, _):
         raise NotImplementedError
