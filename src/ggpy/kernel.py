@@ -1,6 +1,8 @@
+import casadi
 import numpy as np
 import scipy.linalg as sla
 import scipy.optimize as opt
+from casadi import MX, SX
 from numpy.typing import NDArray
 
 from . import fourier
@@ -181,7 +183,7 @@ class RBF(Stationary):
             if full_size is false, then that shape is n x m (scalar kernel)
         """
         if x2 is None:
-            x2 = x1.copy()
+            x2 = x1
             if noise:
                 add = np.eye(x1.shape[0]) * self.hyper_params[1]
             else:
@@ -189,12 +191,26 @@ class RBF(Stationary):
         else:
             add = 0.0
 
-        dx = np.expand_dims(x1, 1) - x2
-        if len(dx.shape) < 3:
-            dx = dx.reshape(dx.shape + (self.input_dims,))
+        is_x1_np = isinstance(x1, np.ndarray)
+        is_x2_np = isinstance(x2, np.ndarray)
+        if is_x1_np and is_x2_np:
+            dx = np.expand_dims(x1, 1) - x2
+            arg = (dx**2).sum(axis=-1) / (self.hyper_params[0] ** 2) * 0.5
+            return np.exp(-arg) + add
+        elif is_x1_np:
+            dx_shape = (x1.shape[0], x2.shape[0])
+            dx = SX(dx_shape[0], dx_shape[1])
+            for (i, j) in np.ndindex(dx_shape):
+                dx[i, j] = casadi.sumsqr(x1[i][None, :] - x2[j, :])
+            dx = casadi.exp(-dx) + add
+        else:
+            dx_shape = (x1.shape[0], x2.shape[0])
+            dx = SX(dx_shape[0], dx_shape[1])
+            for (i, j) in np.ndindex(dx_shape):
+                dx[i, j] = casadi.sumsqr(x1[i, :] - x2[j, :])
+            dx = casadi.exp(-dx) + add
 
-        arg = (dx**2).sum(axis=-1) / (self.hyper_params[0] ** 2) * 0.5
-        return np.exp(-arg) + add
+        return dx
 
     def gradient(self, x1, x2):
         """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
@@ -289,7 +305,7 @@ class LinearAugment:
         outer_transf = np.kron(np.eye(x1.shape[0]), self.transformation)
         ot2 = np.kron(np.eye(x2.shape[0]), self.transformation)
 
-        return outer_transf @ k @ ot2.T + add
+        return outer_transf @ k @ ot2.T + add + 1e-10
 
     def gradient(self, x1, x2):
         """Return the gradient of the covariance of (X_1, X_2) with respect to X_1

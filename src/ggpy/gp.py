@@ -17,21 +17,62 @@ class GP:
         self.train_outputs = np.empty((0, self.kernel.output_dims))
         self.train_inputs = np.empty((0, self.kernel.input_dims))
         self.cho = None
+        self.k = None
 
-    def add_points(self, x, y):
-        self.train_inputs = np.vstack(
-            (self.train_inputs, x.reshape((-1, self.kernel.input_dims)))
-        )
+    def add_points(self, x, y, fit=False):
+        # TODO: Docs and assume x y are correct shape. Makes no sense to reshape in here.
+        new_x = x.reshape((-1, self.kernel.input_dims))
+
+        if fit:
+            if self.k is None:
+                self.k = self.kernel.eval(self.train_inputs)
+
+            if self.cho is None:
+                self.train_inputs = np.vstack((self.train_inputs, new_x))
+                self.train_outputs = np.vstack(
+                    (self.train_outputs, y.reshape((-1, self.kernel.output_dims)))
+                )
+                self.fit()
+                return
+            else:
+                # Assume that self.cho factorizes the kernel with all the current data.
+                # Get the new kernel components
+                old_size = self.train_inputs.shape[0]
+                new_size = old_size + new_x.shape[0]
+                old_k = self.k.copy()
+                self.k = np.empty((new_size, new_size))
+                self.k[:old_size, :old_size] = old_k
+                self.k[:old_size, old_size:] = self.kernel.eval(
+                    self.train_inputs, new_x
+                )
+                self.k[old_size:, :old_size] = self.k[:old_size, old_size:].T
+                self.k[old_size:, old_size:] = self.kernel.eval(new_x)
+
+                old_cho = self.cho.copy()
+                self.cho = np.zeros((new_size, new_size))
+                self.cho[:old_size, :old_size] = old_cho
+
+                self.cho[:old_size, old_size:] = sla.solve_triangular(
+                    old_cho.T,
+                    self.k[:old_size, old_size:],
+                    lower=True,
+                )
+                self.cho[old_size:, old_size:] = sla.cholesky(
+                    self.k[old_size:, old_size:]
+                    - self.cho[:old_size, old_size:].T @ self.cho[:old_size, old_size:]
+                )
+
+        self.train_inputs = np.vstack((self.train_inputs, new_x))
         self.train_outputs = np.vstack(
             (self.train_outputs, y.reshape((-1, self.kernel.output_dims)))
         )
-        # TODO Recompute the cholesky decomposition efficiently
 
     def fit(self):
-        # self.kernel.optimize(self.train_inputs, self.train_outputs)
-        # Perform fit steps until convergence
-        k = self.kernel.eval(self.train_inputs)
-        self.cho = sla.cholesky(k + np.identity(k.shape[0]) * 1e-10)
+        if self.k is None:
+            self.k = self.kernel.eval(self.train_inputs)
+        self.cho = sla.cholesky(
+            self.k + np.identity(self.train_inputs.shape[0]) * 1e-10
+        )
 
     def cho_add_column(self, _):
         raise NotImplementedError
