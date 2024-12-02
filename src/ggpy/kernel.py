@@ -65,7 +65,7 @@ class Kernel:
             return self.likelihood(x, y)
 
         old_params = np.array(old_h)
-        bounds = zip(0.1 * old_params, 10 * old_params)
+        bounds = zip(0.01 * old_params, 100 * old_params)
         res = opt.minimize(like_inner, old_h, bounds=(bounds))
         self.hyper_params = res.x
         # print(self.hyper_params)
@@ -202,13 +202,13 @@ class RBF(Stationary):
             dx = SX(dx_shape[0], dx_shape[1])
             for (i, j) in np.ndindex(dx_shape):
                 dx[i, j] = casadi.sumsqr(x1[i][None, :] - x2[j, :])
-            dx = casadi.exp(-dx) + add
+            dx = casadi.exp(-dx / (self.hyper_params[0] ** 2) * 0.5) + add
         else:
             dx_shape = (x1.shape[0], x2.shape[0])
             dx = SX(dx_shape[0], dx_shape[1])
             for (i, j) in np.ndindex(dx_shape):
                 dx[i, j] = casadi.sumsqr(x1[i, :] - x2[j, :])
-            dx = casadi.exp(-dx) + add
+            dx = casadi.exp(-dx / (self.hyper_params[0] ** 2) * 0.5) + add
 
         return dx
 
