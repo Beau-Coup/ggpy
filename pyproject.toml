@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ggpy"
-version = "0.2.5"
+version = "0.2.6"
 description = 'A package for correct Gaussian Processes'
 readme = "README.md"
 requires-python = ">=3.11"
