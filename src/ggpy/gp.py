@@ -47,8 +47,7 @@ class GP:
                 )
                 self.k[old_size:, :old_size] = self.k[:old_size, old_size:].T
                 self.k[old_size:, old_size:] = (
-                    self.kernel.eval(new_x)
-                    + np.identity(self.train_inputs.shape[0]) * 1e-10
+                    self.kernel.eval(new_x) + np.identity(new_x.shape[0]) * 1e-10
                 )
 
                 old_cho = self.cho.copy()
