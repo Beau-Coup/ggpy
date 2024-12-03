@@ -24,7 +24,7 @@ class GP:
         new_x = x.reshape((-1, self.kernel.input_dims))
 
         if fit:
-            if self.k is None:
+            if self.k is None and self.train_inputs.shape[0] != 0:
                 self.k = self.kernel.eval(self.train_inputs)
 
             if self.cho is None:
