@@ -1,7 +1,7 @@
 # ggpy
 
 ![Static Badge](https://img.shields.io/badge/Version-0.1.0-blue?style=for-the-badge)
-![Static Badge](https://img.shields.io/badge/Python-3.9-blue?style=for-the-badge)
+![Static Badge](https://img.shields.io/badge/Python-3.11-blue?style=for-the-badge)
 
 A Gaussian Process package for Python, written in Python.  
 
@@ -11,6 +11,7 @@ A Gaussian Process package for Python, written in Python.
 
 - [Features](#features)
 - [Installation](#installation)
+- [Testing](#testing)
 - [License](#license)
 
 ## Features 
@@ -23,6 +24,12 @@ A Gaussian Process package for Python, written in Python.
 
 ```console
 pip install git+https://github.com/Beau-Coup/ggpy
+```
+
+## Testing
+Run tests by running 
+```console
+pytest
 ```
 
 ## License

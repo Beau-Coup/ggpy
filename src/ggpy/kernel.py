@@ -301,3 +301,161 @@ class LinearAugment:
             An n x input_dims x m tensor of evaluated gradients.
         """
         return self.transformation @ self.prior.gradient(x1, x2)
+
+
+class DiagKernel(Kernel):
+    def __init__(self, input_dims, output_dims, noise, input_noise=None):
+        super().__init__(input_dims, output_dims, noise, input_noise)
+        self.noise = np.ones(output_dims) * noise
+
+    def eval(self, x1, x2=None):
+        """Evaluate the kernel for x1 and x2
+
+        Parameters:
+            x1: (n x self.input_dims) matrix of input points
+            x2: (m x self.input_dims) matrix of input points
+
+        Returns:
+            k(x1, x2): (self.output_dims x n x m) matrix of pairwise kernel computations, i.e. the covariance
+        """
+        if x2 is None:
+            x2 = x1
+            add = np.eye(x1.shape[0])[None, :, :] * self.noise[:, None, None]
+        else:
+            add = 0.0
+
+        covs = np.array([self._eval_single(x1, x2, i) for i in range(self.output_dims)])
+        return covs + add
+
+    def _eval_single(self, x1, x2, idx):
+        """Evaluate the kernel for a single output component."""
+        raise NotImplementedError
+
+    def gradient(self, x1, x2):
+        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
+        d/dx1 (k(x1, x2))
+
+        Parameters
+        ----------
+            x1: n x input_dims matrix of input points at which to evaluate the gradient
+            x2: m x input_dims matrix of points at which to evaluate the covariance
+
+        Returns
+        -------
+            An output_dims x n x m x input_dims tensor of evaluated gradients.
+        """
+        grads = np.array(
+            [self._gradient_single(x1, x2, i) for i in range(self.output_dims)]
+        )
+        return grads
+
+    def _gradient_single(self, x1, x2, idx):
+        """Evaluate the gradient of the covariance for a single output component."""
+        raise NotImplementedError
+
+    def likelihood(self, x, y):
+        """Return the likelihood of a set of input-output pairs,
+        according to the posterior kernel.
+
+        Parameters
+        ----------
+            x: (n x input_dims)
+            y: (n x output_dims)
+        """
+        covs = self.eval(x)
+        cov_ls = [sla.cho_factor(covs[i]) for i in range(self.output_dims)]
+        sols = np.stack(
+            [sla.cho_solve(cov_ls[i], y[:, i]) for i in range(self.output_dims)], axis=0
+        )
+        dets = np.array(
+            [cov_ls[i][0].diagonal().prod() ** 2 for i in range(self.output_dims)]
+        )
+
+        lds = np.log(dets)
+        prod = np.sum([y[:, i].T @ sols[i] for i in range(self.output_dims)])
+        const = x.shape[0] * np.log(2 * np.pi)
+
+        return (np.sum(lds) + prod + const) * 0.5
+
+    def optimize(self, x, y):
+        old_h = self.hyper_params.copy()
+        # Optimize with the gradients stuff
+
+        def like_inner(theta):
+            self.hyper_params = theta
+            return self.likelihood(x, y)
+
+        old_params = np.array(old_h)
+        bounds = [(0.01 * p, 100 * p) for p in old_params]
+        res = opt.minimize(like_inner, old_h, bounds=bounds)
+        self.hyper_params = res.x
+
+        return res.x
+
+
+class DMatrix(DiagKernel):
+    def __init__(self, noise):
+        super().__init__(input_dims=6, output_dims=6, noise=noise)
+        self.hyper_params = [noise] * 6
+
+    def eval(self, x1, x2=None):
+        """Evaluate the kernel for x1 and x2
+        In this case, we specialize the evaluation for the DMatrix kernel.
+
+        Parameters:
+            x1: (n x self.input_dims) matrix of input points
+            x2: (m x self.input_dims) matrix of input points
+
+        Returns:
+            k(x1, x2): (output_dims x n x m) matrix of pairwise kernel computations, i.e. the covariance
+        """
+        return super().eval(x1, x2)
+
+    def _eval_single(self, x1, x2, idx):
+        """Evaluate the kernel for a single output component.
+
+        Parameters:
+            x1: (n x self.input_dims) matrix of input points
+            x2: (m x self.input_dims) matrix of input points
+            idx: Index of the output component (0-5)
+
+        Returns:
+            (n x m) matrix of covariances for the specified output component
+        """
+        p = x1[:, None, :] * x2  # Shape (n, m, 6)
+
+        if idx % 2 == 0:
+            return p[:, :, 0::2].sum(axis=-1)
+        else:
+            return p[:, :, 1::2].sum(axis=-1)
+
+    def gradient(self, x1, x2):
+        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
+        d/dx1 (k(x1, x2))
+
+        Parameters
+        ----------
+            x1: n x input_dims matrix of input points at which to evaluate the gradient
+            x2: m x input_dims matrix of points at which to evaluate the covariance
+
+        Returns
+        -------
+            A output_dims x n x m x input_dims tensor of evaluated gradients.
+        """
+        n = x1.shape[0]
+        m = x2.shape[0]
+
+        gradient = np.zeros((self.output_dims, n, m, self.input_dims))
+
+        # Select the right entries that are non-zero
+        output_mask = np.zeros((self.output_dims, 1, 1, self.input_dims), dtype=bool)
+        output_mask[0::2, :, :, 0::2] = True
+        output_mask[1::2, :, :, 1::2] = True
+
+        # Reshape x2 for broadcasting (1, m, 1, input_dims)
+        x2_broadcast = x2.reshape(1, m, 1, self.input_dims)
+
+        # Apply the mask to set the gradient values
+        gradient = np.where(output_mask, x2_broadcast, gradient)
+
+        return gradient
