@@ -459,3 +459,72 @@ class DMatrix(DiagKernel):
         gradient = np.where(output_mask, x2_broadcast, gradient)
 
         return gradient
+
+
+class NaiveDMatrix(Kernel):
+    def __init__(self, noise):
+        super().__init__(input_dims=6, output_dims=6, noise=noise)
+        self.noise = noise
+        self.hyper_params = [noise] * 6
+
+    def eval(self, x1, x2=None):
+        """Evaluate the kernel for x1 and x2
+        In this case, we specialize the evaluation for the DMatrix kernel.
+
+        Parameters:
+            x1: (n x self.input_dims) matrix of input points
+            x2: (m x self.input_dims) matrix of input points
+
+        Returns:
+            k(x1, x2): (6 * n x 6 * m) matrix of pairwise kernel computations, i.e. the covariance
+        """
+        if x2 is None:
+            x2 = x1
+            add = np.eye(6 * x1.shape[0])[None, :, :] * self.noise
+        else:
+            add = 0.0
+
+        p = x1[:, None, :] * x2
+        alpha = p[:, :, ::2].sum(axis=-1)
+        beta = p[:, :, 1::2].sum(axis=-1)
+
+        res = np.zeros((6 * x1.shape[0], 6 * x2.shape[0]))
+        res[::6, ::6] = alpha
+        res[2::6, 2::6] = alpha
+        res[4::6, 4::6] = alpha
+        res[1::6, 1::6] = beta
+        res[3::6, 3::6] = beta
+        res[5::6, 5::6] = beta
+
+        return res + add
+
+    def gradient(self, x1, x2):
+        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
+        d/dx1 (k(x1, x2))
+
+        Parameters
+        ----------
+            x1: n x input_dims matrix of input points at which to evaluate the gradient
+            x2: m x input_dims matrix of points at which to evaluate the covariance
+
+        Returns
+        -------
+            A output_dims x n x m x input_dims tensor of evaluated gradients.
+        """
+        n = x1.shape[0]
+        m = x2.shape[0]
+
+        gradient = np.zeros((self.output_dims, n, m, self.input_dims))
+
+        # Select the right entries that are non-zero
+        output_mask = np.zeros((self.output_dims, 1, 1, self.input_dims), dtype=bool)
+        output_mask[0::2, :, :, 0::2] = True
+        output_mask[1::2, :, :, 1::2] = True
+
+        # Reshape x2 for broadcasting (1, m, 1, input_dims)
+        x2_broadcast = x2.reshape(1, m, 1, self.input_dims)
+
+        # Apply the mask to set the gradient values
+        gradient = np.where(output_mask, x2_broadcast, gradient)
+
+        return gradient

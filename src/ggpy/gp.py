@@ -1,8 +1,10 @@
+from datetime import date
+
 import numpy as np
 import scipy.linalg as sla
 from numpy.typing import NDArray
 
-from .kernel import DiagKernel, Kernel
+from .kernel import *
 
 
 class GP:
@@ -72,9 +74,12 @@ class GP:
     def fit(self):
         if self.k is None:
             self.k = self.kernel.eval(self.train_inputs)
-        self.cho = sla.cholesky(
-            self.k + np.identity(self.train_inputs.shape[0]) * 1e-10
+
+        x = (
+            self.k
+            + np.identity(self.kernel.output_dims * self.train_inputs.shape[0]) * 1e-10
         )
+        self.cho = sla.cholesky(x.squeeze())
 
     def cho_add_column(self, _):
         raise NotImplementedError
@@ -143,6 +148,48 @@ class GP:
 
     def optimize(self):
         self.kernel.optimize(self.train_inputs, self.train_outputs)
+
+    def get_D(self):
+        assert isinstance(self.kernel, NaiveDMatrix), "Not a D Matrix kernel"
+        assert self.cho is not None
+
+        n = self.train_inputs.shape[0]
+
+        ns = np.zeros((2, 6, n))
+        ns[0, :3] = self.train_inputs[:, ::2].T
+        ns[1, 3:] = self.train_inputs[:, 1::2].T
+        single = np.kron(np.eye(3)[:, :, None], ns)
+
+        k_star = np.zeros((6 * n, 18))
+        k_star[::6] = single[0].T
+        k_star[1::6] = single[1].T
+        k_star[2::6] = single[2].T
+        k_star[3::6] = single[3].T
+        k_star[4::6] = single[4].T
+        k_star[5::6] = single[5].T
+
+        prod = sla.cho_solve((self.cho.T, True), k_star).T
+
+        y = prod @ self.train_outputs.flatten()
+        v = np.identity(18) * (1.0 + self.kernel.noise) - prod @ k_star
+
+        # Turn y into the right form for D
+        pattern = np.zeros((6, 6), dtype=bool)
+        pattern[::2, ::2] = True
+        pattern[1::2, 1::2] = True
+
+        d = np.zeros(pattern.shape)
+        d[pattern] = y
+        dv = np.zeros_like(d)
+        dv[pattern] = v.diagonal()
+        try:
+            sla.cho_factor(v)
+            psd = True
+        except:
+            psd = False
+        print(f"v is psd {psd}")
+
+        return d, v
 
 
 class MultiGP(GP):
@@ -376,3 +423,32 @@ class MultiGP(GP):
         self.kernel.optimize(self.train_inputs, self.train_outputs)
         # After optimizing hyperparameters, we need to refit the model
         self.fit()
+
+    def get_D(self):
+        assert isinstance(self.kernel, DMatrix), "Not a D Matrix kernel"
+
+        n = self.train_inputs.shape[0]
+
+        ns = np.zeros((2, 6, n))
+        ns[0, :3] = self.train_inputs[:, ::2].T
+        ns[1, 3:] = self.train_inputs[:, 1::2].T
+        k_star = np.kron(np.eye(3)[:, :, None], ns)
+
+        def _inner(idx):
+            prod = sla.cho_solve((self.chos[idx].T, True), k_star[idx].T).T
+
+            ys = prod @ self.train_outputs[:, idx]
+
+            v = np.identity(18) - prod @ k_star[idx].T
+            return ys, v
+
+        res = [_inner(i) for i in range(self.kernel.output_dims)]
+        ys, vs = tuple(map(np.array, zip(*res)))
+        ys = ys.sum(axis=0)
+        vs = vs.mean(axis=0)
+
+        # Turn y into the right form for D
+        d = np.zeros(36)
+        d[::2] = ys
+
+        return d.reshape((6, 6)), vs.diagonal()
