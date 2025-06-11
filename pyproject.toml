@@ -26,6 +26,9 @@ dependencies = [
     "scipy~=1.13",
 ]
 
+[project.optional-dependencies]
+gui = ["matplotlib"]
+
 [project.urls]
 Documentation = "https://github.com/ab/ggpy#readme"
 Issues = "https://github.com/ab/ggpy/issues"

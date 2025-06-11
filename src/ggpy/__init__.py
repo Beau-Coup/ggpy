@@ -3,4 +3,13 @@
 # SPDX-License-Identifier: MIT
 __all__ = ["gp", "kernel"]
 from .gp import GP, MultiGP
-from .kernel import RBF, DMatrix, Kernel, LinearAugment, NaiveDMatrix, Stationary
+from .kernel import (
+    RBF,
+    DMatrix,
+    Kernel,
+    MultiKernel,
+    NaiveDMatrix,
+    RevLinear,
+    SmallDMatrix,
+    Stationary,
+)

@@ -1,5 +1,3 @@
-from datetime import date
-
 import numpy as np
 import scipy.linalg as sla
 from numpy.typing import NDArray
@@ -16,6 +14,12 @@ class GP:
     def __init__(self, kernel, input_noise):
         self.kernel = kernel
         self.input_noise = input_noise
+        self.train_outputs = np.empty((0, self.kernel.output_dims))
+        self.train_inputs = np.empty((0, self.kernel.input_dims))
+        self.cho = None
+        self.k = None
+
+    def reset(self):
         self.train_outputs = np.empty((0, self.kernel.output_dims))
         self.train_inputs = np.empty((0, self.kernel.input_dims))
         self.cho = None
@@ -86,6 +90,7 @@ class GP:
 
     def predict(self, xs, var=False):
         """Return the mean value of the posterior at the provided points.
+
         Parameters
         ----------
             xs: (n x self.kernel.input_dims) ndarray, points
@@ -111,14 +116,60 @@ class GP:
             else:
                 return ys
 
-        ps = sla.cho_solve((self.cho, False), self.train_outputs.reshape((-1)))
-        cov = self.kernel.eval(xs, self.train_inputs)
-        ys = (cov @ ps).reshape((xs.shape[0], self.kernel.output_dims))
+        cov = self.kernel.eval(self.train_inputs, xs)
+        ps = sla.cho_solve((self.cho.T, True), cov).T
+        ys = (ps @ self.train_outputs.flatten()).reshape(
+            (xs.shape[0], self.kernel.output_dims)
+        )
 
         if var:
             css = self.kernel.eval(xs, xs)
-            pss = sla.cho_solve((self.cho, False), cov.T)
-            return (ys, css - cov @ pss)
+            return (ys, css - ps @ cov)
+
+        return ys
+
+    def predict_original(self, xs, var=False):
+        """Return the mean value of the original posterior of a linearly transformed GP at the provided points.
+        Parameters
+        ----------
+            xs: (n x self.kernel.input_dims) ndarray, points
+                at which to evaluate the posterior.
+            var: optional bool, whether or not to return the variance/uncertainty at
+                each of the evaluated points.
+
+        Returns
+        -------
+            ys: (n x self.kernel.output_dims) ndarray the evaluated points of the posterior,
+            vs: optionally, the (n * self.kernel.output_dims x n * self.kernel.output_dims) ndarray of variances at each point.
+        """
+        assert isinstance(self.kernel, LinearTransformation), (
+            f"Expected a LinearTransformation kernel, not a {type(self.kernel).__name__}"
+        )
+        assert xs.shape == (
+            xs.shape[0],
+            self.kernel.input_dims,
+        ), f"Expected xs to be (n, {self.kernel.input_dims}), got {xs.shape}"
+
+        if self.cho is None:
+            ys = np.zeros((xs.shape[0], self.kernel.prior.output_dims))
+            if var:
+                css = self.kernel.eval(xs, xs)
+                return (ys, css)
+            else:
+                return ys
+
+        # Posteriors have the form A k' K^-1 ...
+
+        # Get the left product
+        semi_k_star = self.kernel.semi_left_eval(self.train_inputs, xs)
+        ps = sla.cho_solve((self.cho.T, True), semi_k_star).T
+        ys = (ps @ self.train_outputs.flatten()).reshape(
+            (xs.shape[0], self.kernel.prior.output_dims)
+        )
+
+        if var:
+            css = self.kernel.prior.eval(xs, xs)
+            return (ys, css - (ps @ semi_k_star))
 
         return ys
 
@@ -139,7 +190,8 @@ class GP:
 
         """
         mean, var = self.predict(xs, var=True)
-        return np.random.multivariate_normal(mean.flatten(), var)
+        res = np.random.multivariate_normal(mean.flatten(), var)
+        return res.reshape((xs.shape[0], self.kernel.output_dims))
 
     def variance(self, xs):
         cov = self.kernel.eval(xs, self.train_inputs)
@@ -150,46 +202,160 @@ class GP:
         self.kernel.optimize(self.train_inputs, self.train_outputs)
 
     def get_D(self):
-        assert isinstance(self.kernel, NaiveDMatrix), "Not a D Matrix kernel"
+        import matplotlib.pyplot as plt
+
+        if isinstance(self.kernel, LinearTransformation):
+            priors, u = self.predict_original(self.train_inputs, var=True)
+
+            x = self.train_inputs[:, 0].copy()
+            o = x.argsort()
+            x = x[o]
+
+            dp = u.diagonal().reshape(priors.shape)
+            y = priors[o, 0]
+            v = dp[o, 0]
+
+            plt.plot(x, y, marker=".")
+            plt.fill_between(x, y - v, y + v, alpha=0.5)
+            plt.plot(x, self.train_outputs[o, 0], marker=".")
+            plt.show()
+
+            kern = self.kernel.prior.kernels[0]
+            # print(kern)
+            gp = GP(kern, None)
+
+            # Add data to the GP
+            xs = self.train_inputs[:, :6]
+            ys = priors[:, :6]
+            # print(xs.shape, ys.shape)
+            gp.add_points(xs, ys, fit=True)
+
+            return gp.get_D()
+
+        if isinstance(self.kernel, SmallDMatrix):
+            assert self.cho is not None
+
+            # Be lazy and just make another GP to get D but using the data this GP thinks belong to the D term.
+            n = self.train_inputs.shape[0]
+
+            a = self.train_inputs[:, 2::2]
+            b = self.train_inputs[:, 1::2]
+
+            k_star = np.zeros((6 * n, 14))
+            k_star[::6, 0] = self.train_inputs[:, 0]
+            k_star[1::6, 1:4] = b
+            k_star[2::6, 4:6] = a
+            k_star[3::6, 6:9] = b
+            k_star[4::6, 9:11] = a
+            k_star[5::6, 11:14] = b
+            k_star = k_star @ self.kernel.prior_unc
+
+            prod = sla.cho_solve((self.cho.T, True), k_star).T
+
+            y = prod @ self.train_outputs.flatten()
+            v = self.kernel.prior_unc - prod @ k_star
+
+            # Turn y into the right form for D
+            pattern = np.zeros((6, 6), dtype=bool)
+            pattern[0, 0] = True
+            pattern[2::2, 2::2] = True
+            pattern[1::2, 1::2] = True
+            pattern = np.nonzero(pattern)
+
+            d = np.zeros((6, 6))
+            d[pattern] = y
+            dv = np.zeros_like(d)
+            dv[pattern] = v.diagonal()
+
+        elif isinstance(self.kernel, NaiveDMatrix):
+            assert self.cho is not None
+
+            # Be lazy and just make another GP to get D but using the data this GP thinks belong to the D term.
+            n = self.train_inputs.shape[0]
+
+            ns = np.zeros((2, 6, n))
+            ns[0, :3] = self.train_inputs[:, ::2].T
+            ns[1, 3:] = self.train_inputs[:, 1::2].T
+            single = np.kron(np.eye(3)[:, :, None], ns)
+
+            k_star = np.zeros((6 * n, 18))
+            k_star[::6] = single[0].T
+            k_star[1::6] = single[1].T
+            k_star[2::6] = single[2].T
+            k_star[3::6] = single[3].T
+            k_star[4::6] = single[4].T
+            k_star[5::6] = single[5].T
+            k_star *= self.kernel.scale
+
+            prod = sla.cho_solve((self.cho.T, True), k_star).T
+
+            y = prod @ self.train_outputs.flatten()
+            v = np.identity(18) * self.kernel.scale - prod @ k_star
+
+            # Turn y into the right form for D
+            pattern = np.zeros((6, 6), dtype=bool)
+            pattern[::2, ::2] = True
+            pattern[1::2, 1::2] = True
+            pattern = np.nonzero(pattern)
+
+            d = np.zeros((6, 6))
+            d[pattern] = y
+            dv = np.zeros_like(d)
+            dv[pattern] = v.diagonal()
+        else:
+            raise Exception(f"Expected a DMatrix kernel, got {self.kernel}")
+
+        return d, dv
+
+        # def get_D(self):
+        #     # assert isinstance(self.kernel, NaiveDMatrix), "Not a D Matrix kernel"
+        #     # I don't know see the derivation
+        #     n = self.train_inputs.shape[0]
+        #
+        #     ns = np.zeros((2, 6, n))
+        #     ns[0, :3] = self.train_inputs[:, ::2].T
+        #     ns[1, 3:] = self.train_inputs[:, 1::2].T
+        #     single = np.kron(np.eye(3)[:, :, None], ns)
+        #
+        #     k_star = np.zeros((6 * n, 18))
+        #     k_star[::6] = single[0].T
+        #     k_star[1::6] = single[1].T
+        #     k_star[2::6] = single[2].T
+        #     k_star[3::6] = single[3].T
+        #     k_star[4::6] = single[4].T
+        #     k_star[5::6] = single[5].T
+        #
+        #
+        #     # Cheating see derivation by assuming white noise
+        #     noise = np.eye(6 * self.train_inputs.shape[0]) + self.kernel.noise
+        #     k = np.eye(18)
+        #
+        #     m = noise.shape[0] + 18
+        #     sig = np.zeros((m, m))
+        #     sig[:-18, :-18] = noise
+        #     sig[-18:, -18:] = k
+        #
+        #     # weight = k_star.T @ k_star / (1.0 + self.kernel.noise)
+        #     aug_kstar = np.concatenate([k_star, np.eye(18)])
+        #     lp = np.linalg.lstsq(sig.T, aug_kstar)[0].T
+        #
+        #     aug_outputs = np.zeros(lp.shape[1])
+        #     aug_outputs[: 6 * n] = self.train_outputs.flatten()
+        #     ghat = np.linalg.pinv(lp @ aug_kstar) @ lp @ aug_outputs
+        #
+        #     pattern = np.zeros((6, 6), dtype=bool)
+        #     pattern[::2, ::2] = True
+        #     pattern[1::2, 1::2] = True
+        #
+        #     d = np.zeros(pattern.shape)
+        #     d[pattern] = ghat
+        #
+        #     return d
+
+    def get_line(self):
         assert self.cho is not None
-
-        n = self.train_inputs.shape[0]
-
-        ns = np.zeros((2, 6, n))
-        ns[0, :3] = self.train_inputs[:, ::2].T
-        ns[1, 3:] = self.train_inputs[:, 1::2].T
-        single = np.kron(np.eye(3)[:, :, None], ns)
-
-        k_star = np.zeros((6 * n, 18))
-        k_star[::6] = single[0].T
-        k_star[1::6] = single[1].T
-        k_star[2::6] = single[2].T
-        k_star[3::6] = single[3].T
-        k_star[4::6] = single[4].T
-        k_star[5::6] = single[5].T
-
-        prod = sla.cho_solve((self.cho.T, True), k_star).T
-
-        y = prod @ self.train_outputs.flatten()
-        v = np.identity(18) * (1.0 + self.kernel.noise) - prod @ k_star
-
-        # Turn y into the right form for D
-        pattern = np.zeros((6, 6), dtype=bool)
-        pattern[::2, ::2] = True
-        pattern[1::2, 1::2] = True
-
-        d = np.zeros(pattern.shape)
-        d[pattern] = y
-        dv = np.zeros_like(d)
-        dv[pattern] = v.diagonal()
-        try:
-            sla.cho_factor(v)
-            psd = True
-        except:
-            psd = False
-        print(f"v is psd {psd}")
-
-        return d, v
+        ps = sla.cho_solve((self.cho.T, True), self.train_inputs).T
+        return ps @ self.train_outputs
 
 
 class MultiGP(GP):

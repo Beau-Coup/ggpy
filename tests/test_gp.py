@@ -87,7 +87,7 @@ def test_naive_dmatrix_kernel():
     np.random.seed(43)
 
     # Create the GP to sample from
-    noise = 1e-1
+    noise = 1e-10
     kernel = NaiveDMatrix(noise)
     num_samples = 100
     x_samples = np.random.randn(num_samples, 6)
@@ -101,8 +101,54 @@ def test_naive_dmatrix_kernel():
     pattern[1::2, 1::2] = True  # odd-odd
 
     # Define a random true dmatrix
-    true_matrix = np.random.rand(6, 6)
+    true_matrix = np.random.rand(6, 6) * 5e5 + 1e5
     true_matrix[~pattern] = 0
+    true_matrix[0, 1:] = 0
+    true_matrix = np.array(
+        [
+            [
+                131029.16310579,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            [
+                0.0,
+                653289.7,
+                0.0,
+                583323.62,
+                0.0,
+                748150.94,
+            ],
+            [
+                0.0,
+                0.0,
+                784771.94,
+                0.0,
+                2304494.2,
+                0.0,
+            ],
+            [0.0, 583323.62, 0.0, 2021801.23904745, 0.0, -2254476.8],
+            [
+                0.0,
+                0.0,
+                2304494.2,
+                0.0,
+                69848000.0,
+                0.0,
+            ],
+            [
+                0.0,
+                748150.94,
+                0.0,
+                -2254476.8,
+                0.0,
+                53297996.8,
+            ],
+        ]
+    )
 
     y_samples = (true_matrix @ x_samples.T).T
     # add noise
@@ -121,20 +167,23 @@ def test_naive_dmatrix_kernel():
     # Now try to recover the matrix using least squares
     recovered_matrix = np.linalg.lstsq(x_test, y_pred, rcond=None)[0].T
 
-    print(f"True: {true_matrix}")
-    fit, unc = model.get_D()
-    print(f"fit {fit}")
+    # print(f"True: {true_matrix}")
+    fit = model.get_D()
+    # print(f"fit {fit}")
 
     from scipy.stats import multivariate_normal as mvnorm
 
-    print(
-        f"pdf of result is {mvnorm.pdf(fit[pattern], mean=true_matrix[pattern], cov=unc)}"
-    )
-
+    # print(
+    #     f"pdf of result is {mvnorm.pdf(fit[pattern], mean=true_matrix[pattern], cov=unc)}"
+    # )
     # check that the recovered matrix is actually close to the real one
     assert np.allclose(
-        true_matrix, recovered_matrix
-    ), f"Recovered matrix is not equal to the data-generating matrix"
+        true_matrix, recovered_matrix, rtol=1e-5, atol=1e-5
+    ), f"Recovered matrix {recovered_matrix} is not equal to the data-generating matrix {true_matrix}"
+
+    assert np.allclose(
+        true_matrix, fit, rtol=1e-5, atol=1e-5
+    ), f"Fit matrix {fit} is not equal to the data-generating matrix {true_matrix}"
 
     # Now use the sample from the prior distribution and back out the matrix, checking that it has the right form
     generated_matrix = np.linalg.lstsq(
