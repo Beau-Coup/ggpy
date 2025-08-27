@@ -24,14 +24,12 @@ class GP:
         new_x = x.reshape((-1, self.kernel.input_dims))
 
         if fit:
-            if self.k is None:
-                self.k = self.kernel.eval(self.train_inputs)
-
-            if self.cho is None:
+            if self.cho is None or self.k is None:
                 self.train_inputs = np.vstack((self.train_inputs, new_x))
                 self.train_outputs = np.vstack(
                     (self.train_outputs, y.reshape((-1, self.kernel.output_dims)))
                 )
+                self.k = self.kernel.eval(self.train_inputs)
                 self.fit()
                 return
             else:

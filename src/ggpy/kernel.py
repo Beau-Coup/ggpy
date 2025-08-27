@@ -2,7 +2,7 @@ import casadi
 import numpy as np
 import scipy.linalg as sla
 import scipy.optimize as opt
-from casadi import MX, SX
+from casadi import SX
 from numpy.typing import NDArray
 
 from . import fourier
@@ -200,13 +200,13 @@ class RBF(Stationary):
         elif is_x1_np:
             dx_shape = (x1.shape[0], x2.shape[0])
             dx = SX(dx_shape[0], dx_shape[1])
-            for (i, j) in np.ndindex(dx_shape):
+            for i, j in np.ndindex(dx_shape):
                 dx[i, j] = casadi.sumsqr(x1[i][None, :] - x2[j, :])
             dx = casadi.exp(-dx / (self.hyper_params[0] ** 2) * 0.5) + add
         else:
             dx_shape = (x1.shape[0], x2.shape[0])
             dx = SX(dx_shape[0], dx_shape[1])
-            for (i, j) in np.ndindex(dx_shape):
+            for i, j in np.ndindex(dx_shape):
                 dx[i, j] = casadi.sumsqr(x1[i, :] - x2[j, :])
             dx = casadi.exp(-dx / (self.hyper_params[0] ** 2) * 0.5) + add
 
@@ -265,9 +265,9 @@ class RBF(Stationary):
 
 class LinearAugment:
     def __init__(self, prior, transformation, noise):
-        assert (
-            transformation.shape[1] == prior.output_dims
-        ), f"Incorrect transformation, expected {( transformation.shape[0],prior.output_dims )}, got {transformation.shape}"
+        assert transformation.shape[1] == prior.output_dims, (
+            f"Incorrect transformation, expected {(transformation.shape[0], prior.output_dims)}, got {transformation.shape}"
+        )
         self.prior = prior
         self.transformation = transformation
         self.input_dims = self.prior.input_dims
