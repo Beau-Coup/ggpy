@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ggpy"
-version = "0.2.2"
+version = "0.2.3"
 description = 'A package for correct Gaussian Processes'
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,8 +22,9 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "numpy~=1.26",
-    "scipy~=1.13",
+    "numpy",
+    "scipy",
+    "casadi",
 ]
 
 [project.urls]
@@ -60,4 +61,10 @@ exclude_lines = [
 [tool.pytest.ini_options]
 addopts = [
     "--import-mode=importlib",
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.9.4",
+    "pytest>=8.4.2",
 ]
