@@ -1,117 +1,114 @@
-import numpy as np
-import matplotlib.pyplot as plt
+"""Shifted / centered discrete Fourier transforms.
+
+The transforms here are *centered*: frequencies are measured from ``(N - 1) / 2``
+rather than from zero, which is not what :func:`jax.numpy.fft.fft` computes. That is
+why these are hand-rolled rather than delegating to ``jnp.fft``.
+
+Only :func:`ifft_v` and :func:`ifft2_v` are used by the library proper (by
+``Stationary.sample_prior``); the rest are the reference implementations they were
+validated against, and are exercised by ``tests/test_fourier.py``.
+
+Everything is written against ``jax.numpy`` and is jit/vmap-compatible: the
+recursions and ``while`` loops below run over *static shapes*, so they unroll at
+trace time.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+
+from . import _config  # noqa: F401  (enables x64)
+
+__all__ = [
+    "ft", "ift", "fft", "fft_v", "ifft", "ifft_v",
+    "ft2", "ift2", "fft2", "fft2_v", "ifft2", "ifft2_v",
+]
 
 
 def ft(signal, f_shift, x_shift):
+    """Brute-force centered DFT of a 1-D signal.
+
+    For signals of even length the zero frequency component is ignored, which
+    equates to assuming it is zero. Frequencies are centered at ``(N - 1) / 2``.
+
+    :param signal: array of shape ``(N,)``, the signal to transform
+    :param f_shift: frequency-space origin
+    :param x_shift: position-space origin
+    :return: the frequency-space representation, shape ``(N,)``.
+        Note: for a pure real signal the real part of the transform is even and the
+        imaginary part is odd, across the midpoint.
     """
-    This functions computes the fourier transform of the given signal.
-    For signals of even length, the zero frequency component is ignored.
-    This equates to it being assumed to be zero. The frequencies are centers at
-    (N - 1) / 2. Each frequency is calculated from that point.
-
-    For the purposes of this exercises, the signal length is assumed to be even.
-    Even better, it should be a power of 2. (To implement fft).
-
-    :param signal: array: Shape (N,) The signal to be fourier transformed
-    :param f_shift: integral number
-    :param x_shift: integral number
-
-    :return: transform: the frequency space representation of the signal
-        shape: (N, )
-        Note: for a pure real signal, the real part of the transform is even,
-              while the imaginary part is odd. (across the midpoint).
-    """
-
     N = signal.shape[0]
 
     # Make the position and frequency arrays. Shape matters for broadcasting
-    position = np.arange(N)
-    frequency = np.arange(N).reshape(N, 1)
+    position = jnp.arange(N)
+    frequency = jnp.arange(N).reshape(N, 1)
 
     # Apply the DFT, note that the frequency and position indices are the same
-    transform = (
-        np.exp(-2j * np.pi * (frequency - f_shift) * (position - x_shift) / N) @ signal
+    return (
+        jnp.exp(-2j * jnp.pi * (frequency - f_shift) * (position - x_shift) / N)
+        @ signal
     )
-
-    return transform
 
 
 def ift(transform, f_shift, x_shift):
-    """
-    The inverse of the function ft.
-    Computes the position/time space signal based on the frequency input.
-
-    :param signal:
-    :return:
-    """
-
+    """Inverse of :func:`ft`, normalized with the cosmology convention."""
     N = transform.shape[0]
 
     # Have to change the indices to frequency components. (unitless)
-    positions = np.arange(N)
-    frequencies = np.arange(N).reshape(N, 1)
+    positions = jnp.arange(N)
+    frequencies = jnp.arange(N).reshape(N, 1)
 
-    # Compute it
-    signal = transform @ np.exp(
-        2j * np.pi * (positions - x_shift) * (frequencies - f_shift) / N
+    signal = transform @ jnp.exp(
+        2j * jnp.pi * (positions - x_shift) * (frequencies - f_shift) / N
     )
 
-    # Need to normalize the signal (using cosmology convention).
     return signal / N
 
 
 def fft(signal, f_shift, x_shift):
-    """
-    This functions is the fast version of the ft function.
-    It utilizes the Cooley and Tukey fast fourier transform algorithm.
-    It was modified to work with the shifted DFT.
+    """Recursive Cooley-Tukey version of :func:`ft`, adapted to the shifted DFT.
 
-    :param signal: The signal to be transformed
-    :return: transform: The transformed signal.
+    The recursion is over the static array length, so it unrolls at trace time.
     """
-
     N = signal.shape[0]
 
     # Need to convert the index of the array to the position correspondence
-    k = np.arange(N)
+    k = jnp.arange(N)
 
     # Check the size of the array to determine if symmetry should be applied or not
     if N <= 32:
         return ft(signal, f_shift, x_shift)
-    else:
-        even = fft(signal[::2], f_shift, x_shift / 2)
-        odd = fft(signal[1::2], f_shift, x_shift / 2)
 
-        alpha = np.exp(1j * np.pi * x_shift)
-        beta = np.exp(-2j * np.pi * (k - f_shift) / N)
+    even = fft(signal[::2], f_shift, x_shift / 2)
+    odd = fft(signal[1::2], f_shift, x_shift / 2)
 
-        return np.concatenate(
-            [even + beta[: N // 2] * odd, alpha * (even + beta[N // 2 :] * odd)]
-        )
+    alpha = jnp.exp(1j * jnp.pi * x_shift)
+    beta = jnp.exp(-2j * jnp.pi * (k - f_shift) / N)
+
+    return jnp.concatenate(
+        [even + beta[: N // 2] * odd, alpha * (even + beta[N // 2 :] * odd)]
+    )
 
 
 def fft_v(signal):
-    """
-    This functions is the fast version of the ft function.
-    It utilizes the Cooley and Tukey fast fourier transform algorithm.
-    It was modified to work with the shifted DFT.
-    Also was vectorized for increased efficiency.
+    """Vectorized bottom-up Cooley-Tukey version of :func:`ft`.
 
-    :param signal: The signal to be transformed
-    :return: transform: The transformed signal.
+    Uses the centered-DFT shifts implied by the signal length rather than taking
+    them as arguments.
     """
-
     N = signal.shape[0]
     shift = (N - 1) / N  # This only works for the centered DFT
     f_shift = (N - 1) / 2  # The f_shift is constant through-out
     N_min = min(N, 2)
 
     # Need to convert the index of the array to the position correspondence
-    x = np.arange(N_min)
+    x = jnp.arange(N_min)
     k = x[:, None]
 
-    term = np.exp(-2j * np.pi * (k - f_shift) * (x - shift) / N_min)
-    X = term @ signal.reshape((N_min, -1))
+    term = jnp.exp(-2j * jnp.pi * (k - f_shift) * (x - shift) / N_min)
+    X = term @ signal.reshape((N_min, -1)).astype(term.dtype)
 
     # Now build the array up
     while X.shape[0] < N:
@@ -120,69 +117,58 @@ def fft_v(signal):
         even = X[:, : X.shape[1] // 2]
         odd = X[:, X.shape[1] // 2 :]
 
-        beta = np.exp(-1j * np.pi * (np.arange(X.shape[0]) - f_shift) / X.shape[0])[
+        beta = jnp.exp(-1j * jnp.pi * (jnp.arange(X.shape[0]) - f_shift) / X.shape[0])[
             :, None
         ]
-        alpha = np.exp(1j * np.pi * shift)
+        alpha = jnp.exp(1j * jnp.pi * shift)
 
-        X = np.vstack(
-            [even + beta * odd, alpha * (even - beta * odd)]
-        )  # There's a bug yay
+        X = jnp.vstack([even + beta * odd, alpha * (even - beta * odd)])
 
-    return X.ravel()  # Now to check if it works xD
+    return X.ravel()
 
 
 def ifft(transform, f_shift, x_shift):
-    """
-    Fast version of the inverse fourier transform
-    Designed to be the inverse of fft, and works on the same principles.
-    """
-
+    """Recursive inverse of :func:`fft`, on the same principles."""
     N = transform.shape[0]
 
     # Need to convert the index of the array to the position correspondence
-    x = np.arange(N)
+    x = jnp.arange(N)
 
     # Check the size of the array to determine if symmetry should be applied or not
     if N <= 32:
         return ift(transform, f_shift, x_shift)
-    else:
-        even = ifft(transform[::2], f_shift / 2, x_shift)
-        odd = ifft(transform[1::2], f_shift / 2, x_shift)
 
-        alpha = np.exp(-1j * np.pi * f_shift)
-        beta = np.exp(2j * np.pi * (x - x_shift) / N)
+    even = ifft(transform[::2], f_shift / 2, x_shift)
+    odd = ifft(transform[1::2], f_shift / 2, x_shift)
 
-        return (
-            np.concatenate(
-                [even + beta[: N // 2] * odd, alpha * (even + beta[N // 2 :] * odd)]
-            )
-            / 2
+    alpha = jnp.exp(-1j * jnp.pi * f_shift)
+    beta = jnp.exp(2j * jnp.pi * (x - x_shift) / N)
+
+    return (
+        jnp.concatenate(
+            [even + beta[: N // 2] * odd, alpha * (even + beta[N // 2 :] * odd)]
         )
+        / 2
+    )
 
 
 def ifft_v(signal):
-    """
-    This functions is the fast version of the ft function.
-    It utilizes the Cooley and Tukey fast fourier transform algorithm.
-    It was modified to work with the shifted DFT.
-    Also was vectorized for increased efficiency.
+    """Vectorized inverse of :func:`fft_v`.
 
-    :param signal: The signal to be transformed
-    :return: transform: The transformed signal.
+    Deliberately *not* normalized by ``N``: ``Stationary.sample_prior`` applies its
+    own normalization.
     """
-
     N = signal.shape[0]
     shift = (N - 1) / N  # This only works for the centered DFT
-    x_shift = (N - 1) / 2  # The f_shift is constant through-out
+    x_shift = (N - 1) / 2  # The x_shift is constant through-out
     N_min = min(N, 2)
 
     # Need to convert the index of the array to the position correspondence
-    k = np.arange(N_min)
+    k = jnp.arange(N_min)
     x = k[:, None]
 
-    term = np.exp(2j * np.pi * (x - x_shift) * (k - shift) / N_min)
-    X = term @ signal.reshape((N_min, -1))
+    term = jnp.exp(2j * jnp.pi * (x - x_shift) * (k - shift) / N_min)
+    X = term @ signal.reshape((N_min, -1)).astype(term.dtype)
 
     # Now build the array up
     while X.shape[0] < N:
@@ -191,242 +177,109 @@ def ifft_v(signal):
         even = X[:, : X.shape[1] // 2]
         odd = X[:, X.shape[1] // 2 :]
 
-        beta = np.exp(1j * np.pi * (np.arange(X.shape[0]) - x_shift) / X.shape[0])[
+        beta = jnp.exp(1j * jnp.pi * (jnp.arange(X.shape[0]) - x_shift) / X.shape[0])[
             :, None
         ]
-        alpha = np.exp(-1j * np.pi * shift)
+        alpha = jnp.exp(-1j * jnp.pi * shift)
 
-        X = np.vstack(
-            [even + beta * odd, alpha * (even - beta * odd)]
-        )  # There's a bug yay
+        X = jnp.vstack([even + beta * odd, alpha * (even - beta * odd)])
 
     # Normalization removed for the purposes of this project
-    return X.ravel()  # Now to check if it works xD
+    return X.ravel()
 
 
 def ft2(signal, f_shift, x_shift):
-    """
-    Brute force version of the two-dimensional fourier transform.
+    """Brute-force centered 2-D DFT.
 
-    Ideally, the shape of the signal is of the form (2^n, 2^n) for some integer n.
-    This makes conversion to fft easier, and assures we can take uniform shifts for a centered DFT.
+    Expressed as a pair of contractions rather than the naive double loop. Note the
+    index convention this reproduces: the *row* index of ``signal`` pairs with the
+    second output index and ``N``, while the *column* index pairs with the first
+    output index and ``M``.
 
-    :param signal: shape (M, N) the signal to be transformed / decomposed into fourier components
-    :param f_shift: shape (2,) the frequency shift on the x and y axes respectively
-    :param x_shift: shape (2,) the position shift on x and y respectively
-    :return: transform: shape(M, N) the fourier representation of the signal.
+    :param signal: shape ``(M, N)``
+    :param f_shift: shape ``(2,)``, frequency shift on each axis
+    :param x_shift: shape ``(2,)``, position shift on each axis
+    :return: shape ``(M, N)``
     """
     M, N = signal.shape[0], signal.shape[1]
-    m, n = np.arange(M), np.arange(N)
-    m, n = np.meshgrid(m, n)
+    m, n = jnp.arange(M), jnp.arange(N)
 
-    transform = np.zeros((M, N), dtype=np.complex128)
+    # A[u, b] and B[v, a] are the two separable phase factors.
+    a = jnp.exp(-2j * jnp.pi * (m[:, None] - f_shift[0]) * (n[None, :] - x_shift[0]) / M)
+    b = jnp.exp(-2j * jnp.pi * (n[:, None] - f_shift[1]) * (m[None, :] - x_shift[1]) / N)
 
-    for u in np.arange(M):
-        for v in np.arange(N):
-            transform[u, v] = np.sum(
-                signal
-                * np.exp(
-                    -2j
-                    * np.pi
-                    * (
-                        (u - f_shift[0]) * (m - x_shift[0]) / M
-                        + (v - f_shift[1]) * (n - x_shift[1]) / N
-                    )
-                )
-            )
-
-    return transform
+    return jnp.einsum("ab,ub,va->uv", signal.astype(a.dtype), a, b)
 
 
 def ift2(transform, f_shift, x_shift):
-    """
-    Brute force version of the inverse two-dimensional fourier transform.
-
-    :param transform: shape (M, N) the signal to be transformed / decomposed into fourier components
-    :param f_shift: shape (2,) the frequency shift on the x and y axes respectively
-    :param x_shift: shape (2,) the position shift on x and y respectively
-    :return: signal: shape(M, N) the fourier representation of the signal.
-    """
+    """Brute-force inverse of :func:`ft2`, normalized by ``M * N``."""
     M, N = transform.shape[0], transform.shape[1]
-    m, n = np.arange(M), np.arange(N)
-    u, v = np.meshgrid(m, n)
+    m, n = jnp.arange(M), jnp.arange(N)
 
-    signal = np.zeros((M, N), dtype=np.complex128)
+    c = jnp.exp(2j * jnp.pi * (n[None, :] - f_shift[0]) * (m[:, None] - x_shift[0]) / M)
+    d = jnp.exp(2j * jnp.pi * (m[None, :] - f_shift[1]) * (n[:, None] - x_shift[1]) / N)
 
-    for x in np.arange(M):
-        for y in np.arange(N):
-            signal[y, x] = np.sum(
-                transform
-                * np.exp(
-                    2j
-                    * np.pi
-                    * (
-                        (u - f_shift[0]) * (x - x_shift[0]) / M
-                        + (v - f_shift[1]) * (y - x_shift[1]) / N
-                    )
-                )
-            )
-
-    # Needs to be normalized
-    return signal / M / N
+    return jnp.einsum("ab,xb,ya->yx", transform.astype(c.dtype), c, d) / M / N
 
 
 def fft2(signal, f_shift, x_shift):
-    """
-    This functions is the fast version of the ft2 function.
-    It utilizes the Cooley and Tukey fast fourier transform algorithm.
-    It was modified to work with the shifted DFT, in 2-D.
-    It just calculates the fft column-wise, and then row-wise of the modified signal.
+    """Fast version of :func:`ft2`: a column-wise pass then a row-wise pass."""
+    # Column-wise pass, then row-wise pass. vmap replaces the explicit loops.
+    first_pass = jax.vmap(
+        lambda col: fft(col, f_shift[1], x_shift[1]), in_axes=1, out_axes=1
+    )(signal)
 
-    :param signal: The signal to be transformed
-    The idea is the same as all the other transforms
-    :return: transform: The transformed signal.
-    """
-
-    M, N = signal.shape
-
-    # Perform the column-wise pass
-    first_pass = np.zeros((M, N), dtype=np.complex128)
-
-    for column in range(N):
-        first_pass[:, column] = fft(signal[:, column], f_shift[1], x_shift[1])
-        # Have to check the shifting - is v confusing
-        # Anyway for my use case it's symmetric
-
-    # Now the row-wise pass
-    out = np.zeros((M, N), dtype=np.complex128)
-
-    for row in range(M):
-        out[row] = fft(first_pass[row], f_shift[0], x_shift[0])
-
-    return out
+    return jax.vmap(lambda row: fft(row, f_shift[0], x_shift[0]))(first_pass)
 
 
 def fft2_v(signal):
-    """
-    This functions is the fast version of the ft2 function.
-    It utilizes the Cooley and Tukey fast fourier transform algorithm.
-    It was modified to work with the shifted DFT, in 2-D.
-    It just calculates the fft column-wise, and then row-wise of the modified signal.
-
-    :param signal: The signal to be transformed
-    The idea is the same as all the other transforms
-    :return: transform: The transformed signal.
-    """
-
-    M, N = signal.shape
-
-    # Perform the column-wise pass
-    first_pass = np.zeros((M, N), dtype=np.complex128)
-
-    for column in range(N):
-        first_pass[:, column] = fft_v(signal[:, column])
-        # Have to check the shifting - is v confusing
-        # Anyway for my use case it's symmetric
-
-    # Now the row-wise pass
-    out = np.zeros((M, N), dtype=np.complex128)
-
-    for row in range(M):
-        out[row] = fft_v(first_pass[row])
-
-    return out
+    """Fast vectorized version of :func:`ft2`, using :func:`fft_v` on each axis."""
+    first_pass = jax.vmap(fft_v, in_axes=1, out_axes=1)(signal)
+    return jax.vmap(fft_v)(first_pass)
 
 
 def ifft2(transform, f_shift, x_shift):
-    """
-    Fast version of the 2-D inverse fourier transform
-    Designed to be the inverse of fft2, and works on the same principles.
-    """
+    """Fast inverse of :func:`fft2`, on the same principles."""
+    first_pass = jax.vmap(lambda row: ifft(row, f_shift[0], x_shift[0]))(transform)
 
-    M, N = transform.shape
-
-    # Perform the row-wise pass
-    first_pass = np.zeros((M, N), dtype=np.complex128)
-
-    for row in range(M):
-        first_pass[row] = ifft(transform[row], f_shift[0], x_shift[0])
-
-    # Now the column-wise pass
-    out = np.zeros((M, N), dtype=np.complex128)
-
-    for column in range(N):
-        out[:, column] = ifft(first_pass[:, column], f_shift[1], x_shift[1])
-
-    # No need to normalize, ifft takes care of it
-    return out
+    return jax.vmap(
+        lambda col: ifft(col, f_shift[1], x_shift[1]), in_axes=1, out_axes=1
+    )(first_pass)
 
 
 def ifft2_v(transform):
-    """
-    Fast version of the 2-D inverse fourier transform
-    Designed to be the inverse of fft2, and works on the same principles.
-    """
-
-    M, N = transform.shape
-
-    # Perform the row-wise pass
-    first_pass = np.zeros((M, N), dtype=np.complex128)
-
-    for row in range(M):
-        first_pass[row] = ifft_v(transform[row])
-
-    # Now the column-wise pass
-    out = np.zeros((M, N), dtype=np.complex128)
-
-    for column in range(N):
-        out[:, column] = ifft_v(first_pass[:, column])
-
-    # No need to normalize, ifft takes care of it
-    return out
+    """Fast vectorized inverse of :func:`fft2_v`."""
+    first_pass = jax.vmap(ifft_v)(transform)
+    return jax.vmap(ifft_v, in_axes=1, out_axes=1)(first_pass)
 
 
 if __name__ == "__main__":
-    N = 32
-    space = np.linspace(0, 2 * np.pi, N * N).reshape(N, N)
-    signal = space  # np.cos(space) ** 2 * np.sin(space) ** 2
-    shift = np.array([(N - 1) / 2, (N - 1) / 2])
+    import matplotlib.pyplot as plt
 
-    plt.plot(signal)
-    plt.show()
+    N = 32
+    space = jnp.linspace(0, 2 * jnp.pi, N * N).reshape(N, N)
+    signal = space
+    shift = jnp.array([(N - 1) / 2, (N - 1) / 2])
 
     true = ifft2(signal, shift, shift)
     test = ifft2_v(signal)
 
-    plt.imshow(np.real(true))
-    plt.imshow(np.imag(true))
+    fig, axes = plt.subplots(1, 2)
+    axes[0].imshow(jnp.real(true))
+    axes[1].imshow(jnp.real(test))
     plt.show()
 
-    plt.imshow(np.real(test))
-    plt.imshow(np.imag(test))
-    plt.show()
-    print(np.allclose(true, test))
+    print(jnp.allclose(true, test))
 
-    # k = 25
-    # slow = []
-    # for i in range(k):
-    #    start = time.time()
-    #    fft2(signal, shift, shift)
-    #    slow.append(time.time() - start)
-    #
-    # print(np.asarray(slow).mean())
-    #
-    # fast = []
-    # for i in range(k):
-    #    start = time.time()
-    #    fft2_v(signal)
-    #    fast.append(time.time() - start)
-    #
-    # print(np.asarray(fast).mean())
-
-    # Right now, it all seems to work properly
     """
-    Correctness of the following functions has been established.
+    Correctness of the following pairs has been established (see tests/test_fourier.py):
     1. ft     and ift
-    2. fft    and ifft 
-    3. ft2    and ift2
-    4. fft2   and ifft2
-    5. fft_v  and ifft_v
-    6. fft2_v and ifft2_v
+    2. fft    and ifft
+    3. fft2   and ifft2   (ift2 also inverts fft2)
+    4. fft_v  and ifft_v  (up to the N that ifft_v deliberately does not divide by)
+    5. fft2_v and ifft2_v (likewise, up to M * N)
+
+    Caveat: ft2 returns the *transpose* of fft2 -- it pairs the row index of its
+    input with the second output index. ift2 is transposed in the same way, so the
+    two inverses agree with each other, but ift2(ft2(x)) is not x.
     """

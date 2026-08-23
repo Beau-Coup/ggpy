@@ -16,18 +16,20 @@ authors = [
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+    "jax>=0.8",
+    "optax>=0.2",
     "numpy~=2.2.3",
-    "scipy~=1.13",
 ]
 
 [project.optional-dependencies]
 gui = ["matplotlib"]
+# scipy is not a runtime dependency: jax.scipy.linalg covers everything the library
+# needs. The tests still use scipy for sqrtm and ks_2samp, which jax.scipy lacks.
+test = ["pytest", "scipy~=1.13", "matplotlib"]
 
 [project.urls]
 Documentation = "https://github.com/ab/ggpy#readme"

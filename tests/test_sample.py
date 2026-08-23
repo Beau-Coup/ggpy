@@ -1,3 +1,5 @@
+import jax
+import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as sla
 from scipy import stats
@@ -6,37 +8,44 @@ from ggpy import GP, RBF
 
 
 def test_sampling():
+    """The spectral prior sampler and the posterior sampler must agree in distribution.
+
+    Whitens a ``sample_prior`` draw and a ``GP.sample`` draw by the same posterior
+    covariance and checks the two whitened sets are indistinguishable under a
+    two-sample KS test.
+    """
     L_SCALE = 1
     N = 32
     L = 20.0
-    SEED = None
+    keys = jax.random.split(jax.random.key(0), 2)
 
     rbf_kern = RBF(2, 0.0, L_SCALE)
-    s1 = rbf_kern.sample_prior(N, L, SEED)
+    s1 = rbf_kern.sample_prior(keys[0], N, L)
 
-    model = GP(rbf_kern, None)
-    xs = np.linspace(-L / 2, L / 2, N)
-    x, y = np.meshgrid(xs, xs)
-    xs = np.stack((x, y), axis=-1)
-    xs = xs.reshape((-1, 2))
+    model = GP(rbf_kern)
+    xs = jnp.linspace(-L / 2, L / 2, N)
+    x, y = jnp.meshgrid(xs, xs)
+    xs = jnp.stack((x, y), axis=-1).reshape((-1, 2))
 
     # Back out the random vector from s1
     mu, cov = model.predict(xs, True)
+    cov = np.asarray(cov)
     cinv = np.linalg.pinv(cov + np.identity(cov.shape[0]) * 1e-10)
+    # scipy: jax.scipy.linalg has no sqrtm
     cf = np.real(sla.sqrtm(cinv))
-    noise = cf @ (s1.reshape((-1)) - mu.flatten())
+    noise = cf @ (np.asarray(s1).reshape((-1)) - np.asarray(mu).flatten())
 
     # Now, the noise should be standard normal, which we check statistically.
+    s2 = model.sample(keys[1], xs)
+    n2 = cf @ np.asarray(s2)
+    pv = stats.ks_2samp(noise.ravel(), n2.ravel()).pvalue
+    print(f"Got std {np.std(noise)} compared to {np.std(n2)}")
+    print(f"Got mean {noise.mean()} compared to {n2.mean()}")
 
     import matplotlib.pyplot as plt
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-    s2 = model.sample(xs)
-    s2im = s2.reshape((N, N))
-    n2 = cf @ s2
-    pv = stats.ks_2samp(noise, n2).pvalue
-    print(f"Got std {np.std(noise)} compared to {np.std(n2)}")
-    print(f"Got mean {noise.mean()} compared to {n2.mean()}")
+    s2im = np.asarray(s2).reshape((N, N))
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
@@ -56,7 +65,6 @@ def test_sampling():
     divider = make_axes_locatable(axes[1])  # Use the second axis for placement
     cax = divider.append_axes("right", size="5%", pad=0.1)
 
-    # Create a shared colorbar
     fig.colorbar(im1, cax=cax)
 
     plt.tight_layout()

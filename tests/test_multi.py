@@ -1,15 +1,15 @@
-import time
-
+import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import pytest
 
 from ggpy import GP, RBF, MultiKernel
 
 
 def test_linear_transform():
-    np.random.seed(43)
-    transform = np.concatenate([np.eye(2), np.eye(2)]).T
+    """A GP through a linear transform should recover the untransformed components."""
+    keys = jax.random.split(jax.random.key(43), 2)
+    transform = jnp.concatenate([jnp.eye(2), jnp.eye(2)]).T
 
     noise1 = 1e-2
     noise2 = 1e-3
@@ -20,30 +20,22 @@ def test_linear_transform():
     k2 = MultiKernel(rbf2, rbf2)
 
     kernel = MultiKernel(k1, k2)
-    original_model = GP(kernel, None)
+    original_model = GP(kernel)
     transformed = kernel.transform(transform, 0.01)
-    model = GP(transformed, None)
+    model = GP(transformed)
 
     num_samples = 100
-    # x_test = np.random.randn(num_samples)
-    x_test = np.linspace(-1, 1, num_samples)
-    x_test = np.stack(
-        [
-            x_test,
-        ]
-        * 4
-    ).T
+    x_test = jnp.linspace(-1, 1, num_samples)
+    x_test = jnp.stack([x_test] * 4).T
 
-    s_o = original_model.sample(x_test)
-    original_model.add_points(x_test, s_o, fit=True)
+    s_o = original_model.sample(keys[0], x_test)
+    original_model = original_model.add_points(x_test, s_o, fit=True)
     s = (transform @ s_o.T).T
-    # print(f"Samples {s_o} at {x_test}")
-    # print(f"Added: {s}")
 
-    model.add_points(x_test, s, fit=True)
+    model = model.add_points(x_test, s, fit=True)
 
-    xt = np.linspace(-1, 1, 2 * num_samples)
-    xt = np.stack([xt] * 4, axis=1)
+    xt = jnp.linspace(-1, 1, 2 * num_samples)
+    xt = jnp.stack([xt] * 4, axis=1)
 
     reco, _ = model.predict(xt, var=True)  # Should be identical to s
     sor, _ = model.predict_original(xt, var=True)  # Hopefully close to s_o
@@ -59,8 +51,6 @@ def test_linear_transform():
         # Plot recovered components
         a[0].plot(xt, sor[:, i], color=col, linestyle="--", alpha=0.6)
 
-    # a[0].scatter(x_test[:, :], s_o[:, :], color="C5")
-
     for i in range(2):
         col = "C" + str(i)
         # Plot original components
@@ -68,7 +58,7 @@ def test_linear_transform():
         # Plot recovered sum
         a[1].plot(xt, reco[:, i], color=col, linestyle="--", alpha=0.4)
 
-        # Plot sum of recoverd components
+        # Plot sum of recovered components
         a[1].plot(
             xt,
             sor[:, i] + sor[:, i + 2],
@@ -83,30 +73,44 @@ def test_linear_transform():
     a[1].grid()
     plt.show()
 
-    # TODO: get the original prediction and the recovered and compare
+    # The transformed model must track the data it was fitted on. It does not
+    # interpolate it exactly: the transformed kernel carries an observation noise
+    # variance of 0.021, so the posterior is shrunk by up to ~1 noise sd.
+    reco_train, _ = model.predict(x_test, var=True)
+    noise_sd = float(np.sqrt(np.max(np.diag(np.asarray(transformed.noise)))))
+    assert np.allclose(reco_train, s, atol=noise_sd), (
+        "Transformed posterior does not track its own training data"
+    )
+
+    # Recovering the components and re-applying the transform is an exact identity.
+    sor_train, _ = model.predict_original(x_test, var=True)
+    summed = (transform @ sor_train.T).T
+    assert np.allclose(summed, reco_train, atol=1e-9), (
+        "Recovered components do not sum to the transformed posterior"
+    )
 
 
 def test_multi_kernel():
     """Test that the multi kernel works as expected."""
-
-    np.random.seed(43)
+    key = jax.random.key(43)
 
     k1 = RBF(2, 0.1, 1.0)
     k2 = RBF(2, 0.1, 1.0)
     kernel = MultiKernel(k1, k2)
 
-    model = GP(kernel, None)
+    model = GP(kernel)
 
     num_samples = 32
-    # x_samples = np.random.randn(num_samples, 2)
-    # x_samples = np.concatenate([x_samples, x_samples], axis=1)
-    xs = np.linspace(-1, 1, num_samples)
-    X, Y = np.meshgrid(xs, xs)
+    xs = jnp.linspace(-1, 1, num_samples)
+    X, Y = jnp.meshgrid(xs, xs)
 
-    x_samples = np.stack((X.flatten(), Y.flatten()))
-    x_samples = np.concatenate([x_samples, x_samples]).T
+    x_samples = jnp.stack((X.flatten(), Y.flatten()))
+    x_samples = jnp.concatenate([x_samples, x_samples]).T
 
-    samp = model.sample(x_samples)
+    samp = model.sample(key, x_samples)
+
+    assert samp.shape == (num_samples * num_samples, 2)
+    assert np.all(np.isfinite(samp)), "Prior sample contains non-finite values"
 
     s1 = samp[:, 0].reshape((num_samples, num_samples))
     s2 = samp[:, 1].reshape((num_samples, num_samples))

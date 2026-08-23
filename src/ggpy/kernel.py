@@ -1,22 +1,77 @@
-import numpy as np
-import scipy.linalg as sla
-import scipy.optimize as opt
-from numpy.typing import NDArray
+"""Covariance kernels, as immutable JAX pytrees.
 
-from . import fourier
+Every kernel is a frozen dataclass registered as a pytree (see :mod:`ggpy.tree`), so
+it can be passed through ``jit``, ``grad`` and ``vmap`` directly. Hyperparameters are
+traced leaves; ``input_dims`` / ``output_dims`` are static and live in the treedef.
+
+Nothing here mutates: ``optimize`` (in :mod:`ggpy.optimize`) returns a *new* kernel
+rather than reassigning hyperparameters in place.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import jax.scipy.linalg as jsla
+
+from . import (
+    _config,  # noqa: F401  (enables x64)
+    fourier,
+)
+from .tree import pytree_dataclass, set_frozen, static_field
+
+__all__ = [
+    "Kernel",
+    "Stationary",
+    "WhiteNoise",
+    "RBF",
+    "MultiKernel",
+    "LinearTransformation",
+    "DiagKernel",
+    "Sum",
+    "RevLinear",
+    "kernel_eval",
+]
+
+
+def kernel_eval(kernel, x1, x2=None, noise=True):
+    """Jitted entry point for ``kernel.eval``.
+
+    ``kernel`` is a pytree whose *class* is part of its treedef, so JAX compiles a
+    separate kernel per concrete type and per input shape -- no dispatch table needed.
+    """
+    return kernel._eval(x1, x2, noise)
 
 
 class Kernel:
-    input_dims: int
-    hyper_params: list
+    """Base class for covariance kernels.
 
-    def __init__(self, input_dims, output_dims, noise, input_noise=None):
-        self.input_dims = input_dims
-        self.output_dims = output_dims
-        self.noise = noise
-        self.input_noise = input_noise
+    Subclasses are :func:`~ggpy.tree.pytree_dataclass` types; this class only carries
+    shared behavior. ``TRAINABLE`` names the fields :func:`ggpy.optimize.optimize`
+    will fit.
+    """
 
-    def eval(self, x1, x2=None):
+    TRAINABLE: tuple[str, ...] = ()
+
+    def eval(self, x1, x2=None, noise=True):
+        """Evaluate the covariance between ``x1`` and ``x2``.
+
+        Parameters
+        ----------
+            x1: (n x input_dims) matrix of input points
+            x2: (m x input_dims) matrix of input points, or None for ``x1`` against
+                itself, in which case the noise term is included.
+            noise: whether to add the noise term when ``x2`` is None.
+
+        Returns
+        -------
+            The covariance. Shape depends on the kernel; scalar-output kernels give
+            ``(n, m)``, vector-output kernels ``(n * output_dims, m * output_dims)``,
+            and diagonal kernels ``(output_dims, n, m)``.
+        """
+        return kernel_eval(self, x1, x2, noise)
+
+    def _eval(self, x1, x2, noise):
         raise NotImplementedError
 
     def gradient(self, x1, x2):
@@ -31,47 +86,48 @@ class Kernel:
         Returns
         -------
             An output_dims x n x m x input_dims tensor of evaluated gradients.
-            TODO: Figure this out
         """
         raise NotImplementedError
 
-    def likelihood(self, x, y):
-        """Return the likelihood of a set of input-output pairs,
-        according to the posterior kernel.
+    @property
+    def hyper_params(self) -> tuple:
+        """The values :func:`ggpy.optimize.optimize` fits, in ``TRAINABLE`` order."""
+        return tuple(getattr(self, name) for name in self.TRAINABLE)
+
+    def neg_log_likelihood(self, x, y):
+        """Negative log marginal likelihood of input-output pairs under this kernel.
 
         Parameters
         ----------
-            x:
+            x: (n x input_dims) inputs
+            y: (n x output_dims) outputs
+
+        Returns
+        -------
+            A scalar. Lower is better; this is what ``optimize`` minimizes.
         """
         cov = self.eval(x)
-        cov_l = sla.cho_factor(cov)
-        sol = sla.cho_solve(cov_l, y)
-        det = cov_l[0].diagonal().prod() ** 2
+        chol = jnp.linalg.cholesky(cov)
+        sol = jsla.cho_solve((chol, True), y)
 
-        ld = np.log(det)
-        prod = y.T @ sol
-        const = x.shape[0] * np.log(2 * np.pi)
+        # 2 * sum(log(diag(L))) rather than log(prod(diag(L)) ** 2), which underflows.
+        ld = 2.0 * jnp.sum(jnp.log(jnp.diagonal(chol)))
+        prod = jnp.sum(y * sol)
+        const = x.shape[0] * jnp.log(2 * jnp.pi)
 
         return (ld + prod + const) * 0.5
 
-    def optimize(self, x, y):
-        old_h = self.hyper_params.copy()
-        # Optimize with the gradients stuff
+    def optimize(self, x, y, **kwargs):
+        """Fit this kernel's ``TRAINABLE`` hyperparameters to ``(x, y)``.
 
-        def like_inner(theta):
-            self.hyper_params = theta
-            return self.likelihood(x, y)
+        Returns a *new* kernel; see :func:`ggpy.optimize.optimize` for the options.
+        """
+        from .optimize import optimize as _optimize
 
-        old_params = np.array(old_h)
-        bounds = zip(0.01 * old_params, 100 * old_params)
-        res = opt.minimize(like_inner, old_h, bounds=(bounds))
-        self.hyper_params = res.x
-        # print(self.hyper_params)
-
-        return res.x
+        return _optimize(self, x, y, **kwargs)
 
     def transform(self, A, noise):
-        """Return a new kernel which is the augment version of this kernel through A.
+        """Return a new kernel which is the augmented version of this kernel through A.
 
         Parameters
         ----------
@@ -82,53 +138,254 @@ class Kernel:
             A kernel corresponding to the GP that results from transforming
             this GP by the linear transformation A.
         """
-
-        # Utilize the fact that the kernel is already defined, and basically tile it in a bigger matrix.
-        # Do optimizations, (which are definitely necessary) later.
         return LinearTransformation(self, A, noise)
 
-    def __repr__(self) -> str:
-        """Return a string representation of the kernel.
 
-        Returns a concise representation including class name and key properties.
+class Stationary(Kernel):
+    """Kernels that depend only on x1 - x2 implement this.
+
+    This allows for drawing random samples more efficiently.
+    See the Wiener-Khinchin theorem.
+    """
+
+    def power_spectrum(self, k):
+        raise NotImplementedError
+
+    def sample_prior(self, key, n_points: int, length: float):
+        """Generate a random sample from the prior.
+
+        I am not sure this method actually produces a sample with the right
+        properties, but it looks good enough.
+
+        Parameters
+        ----------
+        key : jax.Array
+            A ``jax.random`` PRNG key.
+        n_points : int
+            The number of points to sample use as the grid.
+        length : float
+            The width of the sample in spatial coordinates.
+            Sample interval on [-size / 2, size /2].
+
+        Returns
+        -------
+        ndarray ((n_points,) * input_dims + (output_dims,))
+            The generated sample.
         """
-        class_name = self.__class__.__name__
-        props = [
-            f"input_dims={self.input_dims}",
-            f"output_dims={self.output_dims}",
-            f"noise={self.noise!r}",
-        ]
+        k_re, k_im = jax.random.split(key)
+        half = int(n_points / 2)
+        center = (n_points - 1) / 2.0
 
-        if hasattr(self, "transformation"):
-            props.append(f"transformation={self.transformation!r}")
+        # Handle 1D case
+        if self.input_dims == 1:
+            x = jnp.arange(n_points)
 
-        # Include input_noise only if it's set
-        if hasattr(self, "input_noise") and self.input_noise is not None:
-            props.append(f"input_noise={self.input_noise!r}")
+            # Calculate wave numbers for 1D
+            k = jnp.abs(x - center) * (n_points - 1) / length / n_points
 
-        # Include hyperparameters if available
-        if hasattr(self, "hyper_params"):
-            props.append(f"hyper_params={self.hyper_params!r}")
+            # Apply power spectrum
+            grid = self.power_spectrum(k) * length
 
-        return f"{class_name}({', '.join(props)})"
+            # Generate noise in frequency domain
+            aj = jnp.zeros(n_points, dtype=jnp.complex128)
+            aj = aj.at[:half].set(
+                jax.random.normal(k_re, (half,)) + jax.random.normal(k_im, (half,)) * 1j
+            )
+            # Ensure Hermitian symmetry for real output
+            aj = aj.at[half:].set(jnp.conj(aj[half - 1 :: -1]))
+
+            # Scale by power spectrum
+            aj = aj * (grid / jnp.sqrt(2))
+
+            # Inverse FFT
+            out = fourier.ifft_v(aj) * n_points / length
+
+            assert jnp.allclose(
+                jnp.zeros(n_points), jnp.imag(out), atol=1e-10, rtol=1e-08
+            )
+            return jnp.real(out)
+
+        # Original 2D case
+        x = jnp.arange(n_points)
+        y = jnp.arange(n_points)
+
+        x, y = jnp.meshgrid(x, y)
+        k = (
+            jnp.hypot(x - center, y - center)
+            * (n_points - 1)
+            / length
+            / n_points
+            / jnp.sqrt(2)
+        )
+
+        grid = self.power_spectrum(k) * length * jnp.sqrt(2)
+
+        aj = jnp.zeros((n_points, n_points), dtype=jnp.complex128)
+        # We are generating the right half of the noise
+        aj = aj.at[:, half:].set(
+            jax.random.normal(k_re, (n_points, half))
+            + jax.random.normal(k_im, (n_points, half)) * 1j
+        )
+        # We want [-x, -y] = conj(x, y)
+        aj = aj.at[:, :half].set(jnp.conj(aj[-1::-1, -1 : half - 1 : -1]))
+
+        aj = aj * (grid / 2)
+
+        out = fourier.ifft2_v(aj) / length / length  # Unnormalized
+
+        assert jnp.allclose(
+            jnp.zeros((n_points, n_points)), jnp.imag(out), atol=1e-10, rtol=1e-08
+        )
+        return jnp.real(out)
 
 
+@pytree_dataclass(init=False)
+class WhiteNoise(Kernel):
+    """Pure diagonal noise; zero covariance between distinct points."""
+
+    noise: jax.Array
+    input_noise: jax.Array | None
+    input_dims: int = static_field()
+    output_dims: int = static_field()
+
+    def __init__(self, input_dims, output_dims, noise, input_noise=None):
+        set_frozen(
+            self,
+            input_dims=input_dims,
+            output_dims=output_dims,
+            noise=noise,
+            input_noise=input_noise,
+        )
+
+    def _eval(self, x1, x2, noise):
+        n = x1.shape[0] * self.output_dims
+        if x2 is None:
+            if noise:
+                return jnp.eye(n) * self.noise
+            return jnp.zeros((n, n))
+        return jnp.zeros((n, x2.shape[0] * self.output_dims))
+
+    def gradient(self, x1, x2):
+        return jnp.zeros((x1.shape[0], self.input_dims, x2.shape[0]))
+
+
+@pytree_dataclass(init=False)
+class RBF(Stationary):
+    """Squared-exponential kernel with a single length scale."""
+
+    TRAINABLE = ("length_scale",)
+
+    noise: jax.Array
+    length_scale: jax.Array
+    scale: jax.Array
+    input_noise: jax.Array | None
+    input_dims: int = static_field()
+    output_dims: int = static_field()
+
+    def __init__(self, input_dims, noise, length_scale, scale=1.0, input_noise=None):
+        set_frozen(
+            self,
+            input_dims=input_dims,
+            output_dims=1,
+            noise=noise,
+            length_scale=length_scale,
+            scale=scale,
+            input_noise=input_noise,
+        )
+
+    def _eval(self, x1, x2, noise):
+        """Evaluate the kernel for x1 and x2
+
+        Parameters:
+            x1: (n x self.input_dims) matrix of input points
+            x2: (m x self.input_dims) matrix of input points
+
+        Returns:
+            k(x1, x2): n x m matrix of pairwise kernel computations, i.e. the covariance
+        """
+        add = 0.0
+        if x2 is None:
+            x2 = x1
+            if noise:
+                add = jnp.eye(x1.shape[0]) * self.noise
+
+        dx = jnp.expand_dims(x1, 1) - x2
+        arg = (dx**2).sum(axis=-1) / (self.length_scale**2) * 0.5
+        return self.scale * jnp.exp(-arg) + add
+
+    def gradient(self, x1, x2):
+        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
+        d/dx1 (k(x1, x2))
+
+        Parameters
+        ----------
+            x1: n x input_dims matrix of input points at which to evaluate the gradient
+            x2: m x input_dims matrix of points at which to evaluate the covariance
+
+        Returns
+        -------
+            An n x input_dims x m tensor of evaluated gradients.
+        """
+        dx = jnp.expand_dims(x1, 1) - x2
+        if dx.ndim < 3:
+            dx = dx.reshape(dx.shape + (self.input_dims,))
+        dx = jnp.swapaxes(dx, 1, 2)  # n x input_dims x m
+        dk = -dx / self.length_scale**2  # n x input_dims x m
+        k = self.eval(x1, x2)  # n x m
+        return dk * k[:, None, :]
+
+    def get_length_scale(self):
+        """Return the fit length scale of the kernel."""
+        return self.length_scale
+
+    def get_noise(self):
+        """Return the fit noise value of the kernel."""
+        return self.noise
+
+    def power_spectrum(self, k):
+        """Return the power spectrum of the kernel at a particular wave number.
+
+        Given Wiener-Khinchin, this is the same as the Fourier Transform of the kernel.
+
+        Parameters
+        ----------
+        k : float | jax.Array
+            The wave number(s) at which to evaluate the power spectrum.
+
+        Returns
+        -------
+        float | jax.Array
+            The power of the given wave number(s).
+        """
+        return (
+            jnp.sqrt(2 * jnp.pi)
+            * self.length_scale
+            * jnp.exp(-2 * ((jnp.pi * k * self.length_scale) ** 2))
+        )
+
+
+@pytree_dataclass(init=False)
 class MultiKernel(Kernel):
-    """Class to associate mulitple uncorrelated kernels into a single kernel."""
+    """Class to associate multiple uncorrelated kernels into a single kernel."""
+
+    kernels: tuple
+    noise: jax.Array
+    input_dims: int = static_field()
+    output_dims: int = static_field()
 
     def __init__(self, *kernels):
-        self.kernels = list(kernels)
-
-        self.output_dims = 0
-        self.input_dims = 0
-        for kernel in self.kernels:
-            self.output_dims += kernel.output_dims
-            self.input_dims += kernel.input_dims
-
-        self.noise = sla.block_diag(*[k.noise for k in self.kernels])
+        kernels = tuple(kernels)
+        set_frozen(
+            self,
+            kernels=kernels,
+            input_dims=sum(k.input_dims for k in kernels),
+            output_dims=sum(k.output_dims for k in kernels),
+            noise=jsla.block_diag(*[jnp.atleast_2d(k.noise) for k in kernels]),
+        )
 
     def split_inputs(self, inputs):
         """Split an input vector into a list of inputs for each kernel.
+
         Parameters
         ----------
             inputs: (n x self.input_dims) vector of inputs
@@ -145,16 +402,11 @@ class MultiKernel(Kernel):
 
         return tuple(outputs)
 
-    def eval(self, x1, x2=None):
+    def _eval(self, x1, x2, noise):
         """Put them all together brother.
-        Parameters:
-        ----------
-            x1: tuple of inputs to each kernel
-            x2: same as above
 
-        Returns:
-        -------
-            evaluated kernel in block diagonal matrix
+        Returns the block-diagonal assembly of the component kernels, interleaved so
+        that ``k(x_i, x_j)`` is a contiguous ``output_dims x output_dims`` block.
         """
         if x2 is None:
             x2inp = (None,) * len(self.kernels)
@@ -162,395 +414,153 @@ class MultiKernel(Kernel):
             x2inp = self.split_inputs(x2)
 
         x1inp = self.split_inputs(x1)
-        # reshape the kernels to have the right form , so k(x1, x1), k(x1, x2)...
+        # reshape the kernels to have the right form, so k(x1, x1), k(x1, x2)...
         # right now, the kernels each have the form k1(x1, x1), k1(x1, x2)
         # k(xi, xj) = diag(k1(xi, xj), k2(xi, xj), ...)
-        m, n = x1.shape[0], x2.shape[0] if x2 is not None else x1.shape[0]
-        k = np.zeros((m * self.output_dims, n * self.output_dims))
+        m = x1.shape[0]
+        n = x2.shape[0] if x2 is not None else x1.shape[0]
+        d = self.output_dims
 
-        iinds = np.arange(m)
-        jinds = np.arange(n)
+        # Viewed as (m, d, n, d), the result is just each component kernel dropped
+        # into its own diagonal band -- a static slice update, not a scatter. The
+        # component's own (m * out, n * out) layout reshapes to (m, out, n, out)
+        # with no transpose, since both are output-dimension-minor.
+        k = jnp.zeros((m, d, n, d))
 
         offset = 0
-
-        rows = iinds * self.output_dims
-        cols = jinds * self.output_dims
-
         for k_idx, kernel in enumerate(self.kernels):
-            kvals = kernel.eval(x1inp[k_idx], x2inp[k_idx])
+            kvals = kernel._eval(x1inp[k_idx], x2inp[k_idx], noise)
             out = kernel.output_dims
 
-            # Get the kernel into d x d blocks
-            blocks = np.stack(np.split(kvals, m))
-            blocks = np.stack(np.split(blocks, n, axis=-1), axis=1)
+            k = k.at[:, offset : offset + out, :, offset : offset + out].set(
+                kvals.reshape(m, out, n, out)
+            )
+            offset += out
 
-            # block_idx = np.ix_(np.arange(out), np.arange(out))
-
-            # expand the indices
-            # start = k_idx * out + offset
-            ksize = np.arange(out)
-            row_idx = rows[..., None] + ksize + offset  # m x d
-            col_idx = cols[..., None] + ksize + offset  # n x d
-            # Want to make an m x n x d x d index for the blocks to fit into
-            # print(f"Shapes {row_idx.shape}, {col_idx.shape}, {blocks.shape}")
-
-            k[row_idx[:, None, :, None], col_idx[None, :, None, :]] = blocks
-            offset += kernel.output_dims
-
-        return k
-
-    def _inner_eval(self, xi, xj=None):
-        """Inner evaluation of the kernel.
-        Evaluate only a single pair of inputs.
-        """
-        return np.diag([k.eval(xi, xj) for k in self.kernels])
+        return k.reshape(m * d, n * d)
 
     def gradient(self, x1, x2):
         """Same as above"""
         x1inp = self.split_inputs(x1)
         x2inp = self.split_inputs(x2)
 
-        return sla.block_diag(
+        return jsla.block_diag(
             *[k.gradient(x1inp[i], x2inp[i]) for (i, k) in enumerate(self.kernels)]
         )
 
 
-class Stationary(Kernel):
-    """Kernels that depend only on x1 - x2 implement this.
+@pytree_dataclass(init=False)
+class LinearTransformation(Kernel):
+    """The kernel of ``A f(x)`` where ``f`` has kernel ``prior`` and ``A`` is linear."""
 
-    This allows for drawing random samples more efficiently.
-    See the Wiener-Khinchin theorem.
-    """
+    prior: Kernel
+    transformation: jax.Array
+    noise: jax.Array
+    input_dims: int = static_field()
+    output_dims: int = static_field()
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, kernel, transformation, noise):
+        assert transformation.shape[1] == kernel.output_dims, (
+            f"Incorrect transformation, expected "
+            f"{(transformation.shape[0], kernel.output_dims)}, got {transformation.shape}"
+        )
+        prior_noise = jnp.asarray(kernel.noise).reshape(
+            (kernel.output_dims, kernel.output_dims)
+        )
+        set_frozen(
+            self,
+            prior=kernel,
+            transformation=transformation,
+            input_dims=kernel.input_dims,
+            output_dims=transformation.shape[0],
+            noise=noise + transformation @ prior_noise @ transformation.T,
+        )
 
-    def power_spectrum(self, k: float | NDArray) -> float | NDArray:
-        raise NotImplementedError
-
-    def sample_prior(
-        self, n_points: int, length: float, seed: int | None = None
-    ) -> NDArray:
-        """Generate a random sample from the prior.
-
-        I am not sure this method actually produces a sample with the right properties, but it looks good enough.
-
-        Parameters
-        ----------
-        n_points : int
-            The number of points to sample use as the grid.
-        length : float
-            The width of the sample in spatial coordinates.
-            Sample interval on [-size / 2, size /2].
-
-        Returns
-        -------
-        ndarray ((n_points,) * input_dims + (output_dims,))
-            The generated sample.
-        """
-        if seed is not None:
-            np.random.seed(seed)
-
-        # Handle 1D case
-        if self.input_dims == 1:
-            center = (n_points - 1) / 2.0
-            x = np.arange(n_points)
-
-            # Calculate wave numbers for 1D
-            k = np.abs(x - center) * (n_points - 1) / length / n_points
-
-            # Apply power spectrum
-            grid = self.power_spectrum(k) * length
-            half = int(n_points / 2)
-
-            # Generate noise in frequency domain
-            aj = np.zeros(n_points, dtype=np.complex128)
-            aj[:half] = np.random.randn(half) + (np.random.randn(half) * 1j)
-            # Ensure Hermitian symmetry for real output
-            aj[half:] = np.conj(aj[half - 1 :: -1])
-
-            # Scale by power spectrum
-            aj *= grid / np.sqrt(2)  # * np.exp(1j / 2 / length)
-
-            # Inverse FFT
-            out = fourier.ifft_v(aj) * n_points / length
-
-            assert np.allclose(np.zeros(n_points), np.imag(out), atol=1e-10, rtol=1e-08)
-            return np.real(out)
-
-        # Original 2D case
-        else:
-            center = (n_points - 1) / 2.0
-            x = np.arange(n_points)
-            y = np.arange(n_points)
-
-            x, y = np.meshgrid(x, y)
-            k = (
-                np.hypot(x - center, y - center)
-                * (n_points - 1)
-                / length
-                / n_points
-                / np.sqrt(2)
-            )
-
-            grid = self.power_spectrum(k) * length * np.sqrt(2)
-            half = int(n_points / 2)
-
-            aj = np.zeros((n_points, n_points), dtype=np.complex128)
-            # We are generating the right half of the noise
-            aj[:, half:] = np.random.randn(n_points, half) + (
-                np.random.randn(n_points, half) * 1j
-            )
-            # We want [-x, -y] = conj(x, y)
-            aj[:, :half] = np.conj(aj[-1::-1, -1 : half - 1 : -1])
-
-            aj *= grid / 2
-
-            out = fourier.ifft2_v(aj) / length / length  # Unnormalized
-
-            assert np.allclose(
-                np.zeros((n_points, n_points)), np.imag(out), atol=1e-10, rtol=1e-08
-            )
-            out = np.real(out)
-            return out
-
-
-class WhiteNoise(Kernel):
-    def __init__(self, input_dims, output_dims, noise, input_noise=None):
-        super().__init__(input_dims, output_dims, noise, input_noise=input_noise)
-
-    def eval(self, x1, x2=None):
-        if x2 is None:
-            x2 = x1
-            add = np.eye(x1.shape[0] * self.output_dims) * self.noise
-        else:
-            add = np.zeros(
-                (x1.shape[0] * self.output_dims, x2.shape[0] * self.output_dims)
-            )
-
-        return add
-
-    def gradient(self, x1, x2):
-        return np.zeros((x1.shape[0], self.input_dims, x2.shape[0]))
-
-
-class RBF(Stationary):
-    """Do I want to optimize over the hyperparameters?
-    Why not try?
-    """
-
-    def __init__(self, input_dims, noise, length_scale, scale, input_noise=None):
-        super().__init__(input_dims, 1, noise, input_noise=input_noise)
-        self.hyper_params = [length_scale]
-        self.noise = noise
-        self.scale = scale
-
-    def eval(self, x1, x2=None, noise=True):
+    def _eval(self, x1, x2, noise):
         """Evaluate the kernel for x1 and x2
 
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-
         Returns:
-            k(x1, x2): (out_dims * n) x (out_dims * m) matrix of pairwise kernel computations, i.e. the covariance
-            if full_size is false, then that shape is n x m (scalar kernel)
+            k(x1, x2): (output_dims * n) x (output_dims * m) covariance
         """
+        add = 0.0
         if x2 is None:
             x2 = x1
             if noise:
-                add = np.eye(x1.shape[0]) * self.noise
-            else:
-                add = 0.0
-        else:
-            add = 0.0
-
-        dx = np.expand_dims(x1, 1) - x2
-        arg = (dx**2).sum(axis=-1) / (self.hyper_params[0] ** 2) * 0.5
-        return self.scale * np.exp(-arg) + add
-
-    def gradient(self, x1, x2):
-        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
-        d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
-        Returns
-        -------
-            An n x input_dims x m tensor of evaluated gradients.
-        """
-        dx = np.expand_dims(x1, 1) - x2
-        if len(dx.shape) < 3:
-            dx = dx.reshape(dx.shape + (self.input_dims,))
-        dx = np.swapaxes(dx, 1, 2)  # n x input_dims x m
-        dk = -dx / self.hyper_params[0] ** 2  # n x input_dims x m
-        k = self.eval(x1, x2)  # n x m
-        return dk * k[:, None, :]
-
-    def get_length_scale(self) -> float:
-        """Return the fit length scale of the kernel."""
-        return self.hyper_params[0]
-
-    def get_noise(self) -> float:
-        """Return the fit noise value of the kernel."""
-        return self.noise
-
-    def power_spectrum(self, k: float | NDArray) -> float | NDArray:
-        """Return the power spectrum of the kernel at a particular wave number.
-
-        Given Wiener-Khinchin, this is the same as the Fourier Transform of the kernel.
-
-        Parameters
-        ----------
-        k : float | NDArray
-            The wave number(s) at which to evaluate the power spectrum.
-
-        Ruturns
-        -------
-        float | NDArray
-            The power of the given wave number(s).
-        """
-        return (
-            np.sqrt(2 * np.pi)
-            * self.hyper_params[0]
-            * np.exp(-2 * ((np.pi * k * self.hyper_params[0]) ** 2))
-        )
-
-
-class LinearTransformation(Kernel):
-    def __init__(self, kernel, transformation, noise):
-        assert transformation.shape[1] == kernel.output_dims, (
-            f"Incorrect transformation, expected {(transformation.shape[0], kernel.output_dims)}, got {transformation.shape}"
-        )
-        super().__init__(kernel.input_dims, transformation.shape[0], noise)
-        self.prior = kernel
-        self.transformation = transformation
-        prior_noise = np.array(self.prior.noise)
-
-        prior_noise = prior_noise.reshape(
-            (
-                self.prior.output_dims,
-                self.prior.output_dims,
-            )
-        )
-
-        self.noise = noise + transformation @ prior_noise @ transformation.T
-
-    def eval(self, x1, x2=None):
-        """Evaluate the kernel for x1 and x2
-
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-
-        Returns:
-            k(x1, x2): (self.output_dims * n) x (self.output_dims * m) matrix of pairwise kernel computations, i.e. the covariance
-        """
-        if x2 is None:
-            x2 = x1.copy()
-            add = self.noise
-            add = np.kron(add, np.eye(x1.shape[0]))
-        else:
-            add = 0.0
+                add = jnp.kron(self.noise, jnp.eye(x1.shape[0]))
 
         part = self.semi_left_eval(x1, x2)
-        ot2 = np.kron(np.eye(x2.shape[0]), self.transformation.T)
+        ot2 = jnp.kron(jnp.eye(x2.shape[0]), self.transformation.T)
 
         return part @ ot2 + add
 
     def semi_left_eval(self, x1, x2):
         """Evaluate the kernel for x1 and x2 but apply the transformation on the left.
 
-        This is useful for intermediate calculations, and for recovering an estimate of the original
-        GP posterior. It doesn't really make sense to have x2 = None here so this should not be used
-        to compute the cholesky decomposition directly.
+        This is useful for intermediate calculations, and for recovering an estimate
+        of the original GP posterior. It doesn't really make sense to have x2 = None
+        here so this should not be used to compute the cholesky decomposition directly.
 
-        Parameters:
+        Parameters
         ----------
             x1: (n x self.input_dims) matrix of input points
             x2: (m x self.input_dims) matrix of input points
 
-        Returns:
-        --------
-            k(x1, x2): (self.output_dims * n) x (self.output_dims * m) matrix of pairwise kernel computations, i.e. the covariance
+        Returns
+        -------
+            k(x1, x2): (output_dims * n) x (prior.output_dims * m) covariance
         """
         k = self.prior.eval(x1, x2)
-        outer_transf = np.kron(np.eye(x1.shape[0]), self.transformation)
+        outer_transf = jnp.kron(jnp.eye(x1.shape[0]), self.transformation)
 
         return outer_transf @ k
 
     def gradient(self, x1, x2):
         """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
         d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
-        Returns
-        -------
-            An n x input_dims x m tensor of evaluated gradients.
         """
         return self.transformation @ self.prior.gradient(x1, x2)
 
 
 class DiagKernel(Kernel):
-    def __init__(self, input_dims, output_dims, noise, input_noise=None):
-        super().__init__(input_dims, output_dims, noise, input_noise)
-        self.noise = np.ones(output_dims) * noise
+    """Kernels whose output dimensions are mutually independent.
 
-    def eval(self, x1, x2=None):
+    ``eval`` returns a stacked ``(output_dims, n, m)`` array rather than a dense
+    block matrix, which lets :class:`~ggpy.gp.MultiGP` factorize each output
+    dimension separately.
+    """
+
+    def _eval(self, x1, x2, noise):
         """Evaluate the kernel for x1 and x2
 
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-
         Returns:
-            k(x1, x2): (self.output_dims x n x m) matrix of pairwise kernel computations, i.e. the covariance
+            k(x1, x2): (output_dims x n x m) pairwise covariances
         """
+        add = 0.0
         if x2 is None:
             x2 = x1
-            add = np.eye(x1.shape[0])[None, :, :] * self.noise[:, None, None]
-        else:
-            add = 0.0
+            if noise:
+                add = jnp.eye(x1.shape[0])[None, :, :] * jnp.reshape(
+                    self.noise, (-1, 1, 1)
+                )
 
-        covs = np.array([self._eval_single(x1, x2, i) for i in range(self.output_dims)])
-        return covs + add
+        return self._eval_all(x1, x2) + add
 
-    def _eval_single(self, x1, x2, idx):
-        """Evaluate the kernel for a single output component."""
+    def _eval_all(self, x1, x2):
+        """Evaluate every output component, returning ``(output_dims, n, m)``."""
         raise NotImplementedError
 
     def gradient(self, x1, x2):
         """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
         d/dx1 (k(x1, x2))
 
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
         Returns
         -------
             An output_dims x n x m x input_dims tensor of evaluated gradients.
         """
-        grads = np.array(
-            [self._gradient_single(x1, x2, i) for i in range(self.output_dims)]
-        )
-        return grads
-
-    def _gradient_single(self, x1, x2, idx):
-        """Evaluate the gradient of the covariance for a single output component."""
         raise NotImplementedError
 
-    def likelihood(self, x, y):
-        """Return the likelihood of a set of input-output pairs,
-        according to the posterior kernel.
+    def neg_log_likelihood(self, x, y):
+        """Negative log marginal likelihood, summed over independent output dims.
 
         Parameters
         ----------
@@ -558,316 +568,88 @@ class DiagKernel(Kernel):
             y: (n x output_dims)
         """
         covs = self.eval(x)
-        cov_ls = [sla.cho_factor(covs[i]) for i in range(self.output_dims)]
-        sols = np.stack(
-            [sla.cho_solve(cov_ls[i], y[:, i]) for i in range(self.output_dims)], axis=0
-        )
-        dets = np.array(
-            [cov_ls[i][0].diagonal().prod() ** 2 for i in range(self.output_dims)]
-        )
+        # jnp.linalg.cholesky batches over the leading axis.
+        chols = jnp.linalg.cholesky(covs)
+        sols = jax.vmap(lambda c, t: jsla.cho_solve((c, True), t))(chols, y.T)
 
-        lds = np.log(dets)
-        prod = np.sum([y[:, i].T @ sols[i] for i in range(self.output_dims)])
-        const = x.shape[0] * np.log(2 * np.pi)
+        lds = 2.0 * jnp.sum(jnp.log(jnp.diagonal(chols, axis1=-2, axis2=-1)), axis=-1)
+        prod = jnp.sum(y.T * sols)
+        const = x.shape[0] * jnp.log(2 * jnp.pi)
 
-        return (np.sum(lds) + prod + const) * 0.5
-
-    def optimize(self, x, y):
-        old_h = self.hyper_params.copy()
-        # Optimize with the gradients stuff
-
-        def like_inner(theta):
-            self.hyper_params = theta
-            return self.likelihood(x, y)
-
-        old_params = np.array(old_h)
-        bounds = [(0.01 * p, 100 * p) for p in old_params]
-        res = opt.minimize(like_inner, old_h, bounds=bounds)
-        self.hyper_params = res.x
-
-        return res.x
+        return (jnp.sum(lds) + prod + const) * 0.5
 
 
-class DMatrix(DiagKernel):
-    def __init__(self, noise):
-        super().__init__(input_dims=6, output_dims=6, noise=noise)
-        self.hyper_params = [noise] * 6
-
-    def eval(self, x1, x2=None):
-        """Evaluate the kernel for x1 and x2
-        In this case, we specialize the evaluation for the DMatrix kernel.
-
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-
-        Returns:
-            k(x1, x2): (output_dims x n x m) matrix of pairwise kernel computations, i.e. the covariance
-        """
-        return super().eval(x1, x2)
-
-    def _eval_single(self, x1, x2, idx):
-        """Evaluate the kernel for a single output component.
-
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-            idx: Index of the output component (0-5)
-
-        Returns:
-            (n x m) matrix of covariances for the specified output component
-        """
-        p = x1[:, None, :] * x2  # Shape (n, m, 6)
-
-        if idx % 2 == 0:
-            return p[:, :, 0::2].sum(axis=-1)
-        else:
-            return p[:, :, 1::2].sum(axis=-1)
-
-    def gradient(self, x1, x2):
-        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
-        d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
-        Returns
-        -------
-            A output_dims x n x m x input_dims tensor of evaluated gradients.
-        """
-        n = x1.shape[0]
-        m = x2.shape[0]
-
-        gradient = np.zeros((self.output_dims, n, m, self.input_dims))
-
-        # Select the right entries that are non-zero
-        output_mask = np.zeros((self.output_dims, 1, 1, self.input_dims), dtype=bool)
-        output_mask[0::2, :, :, 0::2] = True
-        output_mask[1::2, :, :, 1::2] = True
-
-        # Reshape x2 for broadcasting (1, m, 1, input_dims)
-        x2_broadcast = x2.reshape(1, m, 1, self.input_dims)
-
-        # Apply the mask to set the gradient values
-        gradient = np.where(output_mask, x2_broadcast, gradient)
-
-        return gradient
-
-
-class NaiveDMatrix(Kernel):
-    def __init__(self, noise, scale=1.0):
-        super().__init__(input_dims=6, output_dims=6, noise=noise)
-        self.scale = scale  # Essentially account for uninformative priors by making the weight smaller.
-        self.noise = noise * np.eye(6)
-        self.hyper_params = [noise] * 6
-
-    def eval(self, x1, x2=None):
-        """Evaluate the kernel for x1 and x2
-        In this case, we specialize the evaluation for the DMatrix kernel.
-
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-
-        Returns:
-            k(x1, x2): (6 * n x 6 * m) matrix of pairwise kernel computations, i.e. the covariance
-        """
-        if x2 is None:
-            x2 = x1
-            add = np.kron(np.eye(x1.shape[0]), self.noise)
-        else:
-            add = 0.0
-
-        p = x1[:, None, :] * x2
-        alpha = p[:, :, ::2].sum(axis=-1)
-        beta = p[:, :, 1::2].sum(axis=-1)
-
-        res = np.zeros((6 * x1.shape[0], 6 * x2.shape[0]))
-        res[::6, ::6] = alpha
-        res[2::6, 2::6] = alpha
-        res[4::6, 4::6] = alpha
-        res[1::6, 1::6] = beta
-        res[3::6, 3::6] = beta
-        res[5::6, 5::6] = beta
-
-        return res * self.scale + add
-
-    def gradient(self, x1, x2):
-        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
-        d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
-        Returns
-        -------
-            A output_dims x n x m x input_dims tensor of evaluated gradients.
-        """
-        n = x1.shape[0]
-        m = x2.shape[0]
-
-        gradient = np.zeros((self.output_dims, n, m, self.input_dims))
-
-        # Select the right entries that are non-zero
-        output_mask = np.zeros((self.output_dims, 1, 1, self.input_dims), dtype=bool)
-        output_mask[0::2, :, :, 0::2] = True
-        output_mask[1::2, :, :, 1::2] = True
-
-        # Reshape x2 for broadcasting (1, m, 1, input_dims)
-        x2_broadcast = x2.reshape(1, m, 1, self.input_dims)
-
-        # Apply the mask to set the gradient values
-        gradient = np.where(output_mask, x2_broadcast, gradient)
-
-        return gradient
-
-
-class SmallDMatrix(Kernel):
-    def __init__(self, noise, prior_uncertainty=1.0):
-        super().__init__(input_dims=6, output_dims=6, noise=noise)
-        self.prior_unc = prior_uncertainty * np.eye(14)
-        self.noise = noise * np.eye(6)
-        self.hyper_params = [noise] * 6
-
-    def eval(self, x1, x2=None):
-        """Evaluate the kernel for x1 and x2
-        In this case, we specialize the evaluation for the DMatrix kernel.
-
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
-
-        Returns:
-            k(x1, x2): (6 * n x 6 * m) matrix of pairwise kernel computations, i.e. the covariance
-        """
-        if x2 is None:
-            x2 = x1
-            add = np.kron(np.eye(x1.shape[0]), self.noise)
-        else:
-            add = 0.0
-
-        l = np.zeros((6 * x1.shape[0], 14))
-        l[::6, 0] = x1[:, 0]
-        l[1::6, 1:4] = x1[:, 1::2]
-        l[2::6, 4:6] = x1[:, 2::2]
-        l[3::6, 6:9] = x1[:, 1::2]
-        l[4::6, 9:11] = x1[:, 2::2]
-        l[5::6, 11:] = x1[:, 1::2]
-
-        r = np.zeros((6 * x2.shape[0], 14))
-        r[::6, 0] = x2[:, 0]
-        r[1::6, 1:4] = x2[:, 1::2]
-        r[2::6, 4:6] = x2[:, 2::2]
-        r[3::6, 6:9] = x2[:, 1::2]
-        r[4::6, 9:11] = x2[:, 2::2]
-        r[5::6, 11:] = x2[:, 1::2]
-
-        res = l @ self.prior_unc @ r.T
-
-        return res + add
-
-    def gradient(self, x1, x2):
-        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
-        d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
-        Returns
-        -------
-            A output_dims x n x m x input_dims tensor of evaluated gradients.
-        """
-        n = x1.shape[0]
-        m = x2.shape[0]
-
-        gradient = np.zeros((self.output_dims, n, m, self.input_dims))
-
-        # Select the right entries that are non-zero
-        output_mask = np.zeros((self.output_dims, 1, 1, self.input_dims), dtype=bool)
-        output_mask[0, :, :, 0] = True
-        output_mask[2::2, :, :, 2::2] = True
-        output_mask[1::2, :, :, 1::2] = True
-
-        # Reshape x2 for broadcasting (1, m, 1, input_dims)
-        x2_broadcast = x2.reshape(1, m, 1, self.input_dims)
-
-        # Apply the mask to set the gradient values
-        gradient = np.where(output_mask, x2_broadcast, gradient)
-
-        return gradient
-
-
+@pytree_dataclass(init=False)
 class Sum(Kernel):
+    """The kernel of the sum of two independent GPs."""
+
+    k1: Kernel
+    k2: Kernel
+    noise: jax.Array
+    input_noise: jax.Array | None
+    input_dims: int = static_field()
+    output_dims: int = static_field()
+
     def __init__(self, k1: Kernel, k2: Kernel, input_noise=None):
         assert k1.input_dims == k2.input_dims
         assert k1.output_dims == k2.output_dims
-        super().__init__(
-            k1.input_dims, k1.output_dims, k1.noise + k2.noise, input_noise
+        set_frozen(
+            self,
+            k1=k1,
+            k2=k2,
+            input_dims=k1.input_dims,
+            output_dims=k1.output_dims,
+            noise=k1.noise + k2.noise,
+            input_noise=input_noise,
         )
-        self.k1 = k1
-        self.k2 = k2
 
-    def eval(self, x1, x2=None):
-        return self.k1.eval(x1, x2) + self.k2.eval(x1, x2)
+    def _eval(self, x1, x2, noise):
+        return self.k1._eval(x1, x2, noise) + self.k2._eval(x1, x2, noise)
 
     def gradient(self, x1, x2):
         """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
         d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
 
         Returns
         -------
             An output_dims x n x m x input_dims tensor of evaluated gradients.
-            TODO: Figure this out
         """
-        raise self.k1.gradient(x1, x2) + self.k2.gradient(x1, x2)
+        return self.k1.gradient(x1, x2) + self.k2.gradient(x1, x2)
 
 
+@pytree_dataclass(init=False)
 class RevLinear(Kernel):
-    def __init__(self, noise):
-        super().__init__(1, 1, noise, None)
+    """Scalar linear kernel ``k(x1, x2) = x1 * x2``."""
 
-    def eval(self, x1, x2=None):
+    TRAINABLE = ("noise",)
+
+    noise: jax.Array
+    input_noise: jax.Array | None
+    input_dims: int = static_field()
+    output_dims: int = static_field()
+
+    def __init__(self, noise, input_noise=None):
+        set_frozen(
+            self, input_dims=1, output_dims=1, noise=noise, input_noise=input_noise
+        )
+
+    def _eval(self, x1, x2, noise):
         """Evaluate the kernel for x1 and x2
-        In this case, we specialize the evaluation for a reversed linear kernel.
-
-        Parameters:
-            x1: (n x self.input_dims) matrix of input points
-            x2: (m x self.input_dims) matrix of input points
 
         Returns:
-            k(x1, x2): (n x m) matrix of pairwise kernel computations, i.e. the covariance
+            k(x1, x2): (n x m) matrix of pairwise kernel computations
         """
+        add = 0.0
         if x2 is None:
             x2 = x1
-            add = np.eye(x1.shape[0]) * self.noise
-        else:
-            add = 0.0
-        prod = np.expand_dims(x1, 1) * x2
-        return prod.squeeze() + add
+            if noise:
+                add = jnp.eye(x1.shape[0]) * self.noise
+
+        prod = jnp.expand_dims(x1, 1) * x2
+        return prod.squeeze(axis=-1) + add
 
     def gradient(self, x1, x2):
         """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
         d/dx1 (k(x1, x2))
-
-        Parameters
-        ----------
-            x1: n x input_dims matrix of input points at which to evaluate the gradient
-            x2: m x input_dims matrix of points at which to evaluate the covariance
-
-        Returns
-        -------
-            A output_dims x n x m x input_dims tensor of evaluated gradients.
         """
-
-        return x2[None, :] * np.ones(x1.shape[0])
+        return x2[None, :] * jnp.ones(x1.shape[0])

@@ -1,92 +1,150 @@
-import numpy as np
-import scipy.linalg as sla
-from numpy.typing import NDArray
+"""Gaussian process models over the kernels in :mod:`ggpy.kernel`.
 
-from .kernel import *
+Models are immutable pytrees. Anything that used to mutate now returns a *new*
+model, so a fit reads::
+
+    model = GP(kernel)
+    model = model.add_points(x, y, fit=True)
+    ys, vs = model.predict(xs, var=True)
+
+Because array shapes are static under ``jit``, each distinct training-set size
+compiles once. That is inherent to growing a data set point by point; the
+incremental ``add_points`` path still avoids the cubic cost of a full refactorization.
+"""
+
+from __future__ import annotations
+
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+import jax.scipy.linalg as jsla
+
+from . import _config  # noqa: F401  (enables x64)
+from .kernel import Kernel, LinearTransformation
+from .tree import pytree_dataclass, set_frozen
+
+__all__ = ["GP", "MultiGP", "JITTER"]
+
+# Diagonal element added to Cholesky factorization.
+JITTER = 1e-10
 
 
+def _cholesky(k, n_total):
+    """Upper-triangular Cholesky factor of ``k``, regularized by :data:`JITTER`."""
+    return jsla.cholesky(k + jnp.identity(n_total) * JITTER)
+
+
+def _extend_cholesky(old_cho, k_old_new, k_new_new):
+    """Grow an upper Cholesky factor by a new block, without refactorizing.
+
+    Given ``old_cho`` factorizing the existing block and the two new blocks, returns
+    the factor of the enlarged matrix using its Schur complement.
+    """
+    top_right = jsla.solve_triangular(old_cho.T, k_old_new, lower=True)
+    schur = k_new_new - top_right.T @ top_right
+    bottom_right = jsla.cholesky(schur)
+
+    old_size = old_cho.shape[0]
+    new_size = old_size + k_new_new.shape[0]
+    cho = jnp.zeros((new_size, new_size))
+    cho = cho.at[:old_size, :old_size].set(old_cho)
+    cho = cho.at[:old_size, old_size:].set(top_right)
+    return cho.at[old_size:, old_size:].set(bottom_right)
+
+
+def _extend_kernel(old_k, k_old_new, k_new_new):
+    """Assemble the enlarged covariance matrix from its three new blocks."""
+    old_size = old_k.shape[0]
+    new_size = old_size + k_new_new.shape[0]
+    k = jnp.zeros((new_size, new_size))
+    k = k.at[:old_size, :old_size].set(old_k)
+    k = k.at[:old_size, old_size:].set(k_old_new)
+    k = k.at[old_size:, :old_size].set(k_old_new.T)
+    return k.at[old_size:, old_size:].set(k_new_new)
+
+
+@pytree_dataclass(init=False)
 class GP:
-    kernel: Kernel
-    cho: NDArray | None
-    train_inputs: NDArray
-    train_outputs: NDArray
+    """A Gaussian process over a general (possibly correlated-output) kernel."""
 
-    def __init__(self, kernel, input_noise):
-        self.kernel = kernel
-        self.input_noise = input_noise
-        self.train_outputs = np.empty((0, self.kernel.output_dims))
-        self.train_inputs = np.empty((0, self.kernel.input_dims))
-        self.cho = None
-        self.k = None
+    kernel: Kernel
+    train_inputs: jax.Array
+    train_outputs: jax.Array
+    cho: jax.Array | None
+    k: jax.Array | None
+    input_noise: jax.Array | None
+
+    def __init__(self, kernel, input_noise=None):
+        set_frozen(
+            self,
+            kernel=kernel,
+            input_noise=input_noise,
+            train_inputs=jnp.zeros((0, kernel.input_dims)),
+            train_outputs=jnp.zeros((0, kernel.output_dims)),
+            cho=None,
+            k=None,
+        )
 
     def reset(self):
-        self.train_outputs = np.empty((0, self.kernel.output_dims))
-        self.train_inputs = np.empty((0, self.kernel.input_dims))
-        self.cho = None
-        self.k = None
+        """Return a fresh model with the same kernel and no training data."""
+        return type(self)(self.kernel, self.input_noise)
+
+    def _with_data(self, x, y, **changes):
+        """Return a copy with ``(x, y)`` appended to the training set."""
+        return self.replace(
+            train_inputs=jnp.vstack((self.train_inputs, x)),
+            train_outputs=jnp.vstack(
+                (self.train_outputs, y.reshape((-1, self.kernel.output_dims)))
+            ),
+            **changes,
+        )
 
     def add_points(self, x, y, fit=False):
-        # TODO: Docs and assume x y are correct shape. Makes no sense to reshape in here.
+        """Add training points, optionally refreshing the factorization.
+
+        When the model is already fitted, the Cholesky factor is *extended* using the
+        block structure rather than recomputed from scratch.
+
+        Parameters
+        ----------
+            x: (n x input_dims) array of input points
+            y: (n x output_dims) array of corresponding outputs
+            fit: whether to update the factorization as well as the data
+
+        Returns
+        -------
+            A new model. The receiver is left unchanged.
+        """
         new_x = x.reshape((-1, self.kernel.input_dims))
 
-        if fit:
-            if self.k is None and self.train_inputs.shape[0] != 0:
-                self.k = self.kernel.eval(self.train_inputs)
+        if not fit:
+            return self._with_data(new_x, y)
 
-            if self.cho is None:
-                self.train_inputs = np.vstack((self.train_inputs, new_x))
-                self.train_outputs = np.vstack(
-                    (self.train_outputs, y.reshape((-1, self.kernel.output_dims)))
-                )
-                self.fit()
-                return
-            else:
-                # Assume that self.cho factorizes the kernel with all the current data.
-                # Get the new kernel components
-                old_size = self.train_inputs.shape[0]
-                new_size = old_size + new_x.shape[0]
-                old_k = self.k.copy()
-                self.k = np.empty((new_size, new_size))
-                self.k[:old_size, :old_size] = old_k
-                self.k[:old_size, old_size:] = self.kernel.eval(
-                    self.train_inputs, new_x
-                )
-                self.k[old_size:, :old_size] = self.k[:old_size, old_size:].T
-                self.k[old_size:, old_size:] = (
-                    self.kernel.eval(new_x) + np.identity(new_x.shape[0]) * 1e-10
-                )
+        model = self
+        if model.k is None and model.train_inputs.shape[0] != 0:
+            model = model.replace(k=model.kernel.eval(model.train_inputs))
 
-                old_cho = self.cho.copy()
-                self.cho = np.zeros((new_size, new_size))
-                self.cho[:old_size, :old_size] = old_cho
+        if model.cho is None:
+            return model._with_data(new_x, y).fit()
 
-                self.cho[:old_size, old_size:] = sla.solve_triangular(
-                    old_cho.T,
-                    self.k[:old_size, old_size:],
-                    lower=True,
-                )
-                self.cho[old_size:, old_size:] = sla.cholesky(
-                    self.k[old_size:, old_size:]
-                    - self.cho[:old_size, old_size:].T @ self.cho[:old_size, old_size:]
-                )
+        # Assume that cho factorizes the kernel with all the current data, and
+        # extend it with the blocks contributed by the new points.
+        k_old_new = model.kernel.eval(model.train_inputs, new_x)
+        k_new_new = model.kernel.eval(new_x) + jnp.identity(new_x.shape[0]) * JITTER
 
-        self.train_inputs = np.vstack((self.train_inputs, new_x))
-        self.train_outputs = np.vstack(
-            (self.train_outputs, y.reshape((-1, self.kernel.output_dims)))
+        return model._with_data(
+            new_x,
+            y,
+            k=_extend_kernel(model.k, k_old_new, k_new_new),
+            cho=_extend_cholesky(model.cho, k_old_new, k_new_new),
         )
 
     def fit(self):
-        if self.k is None:
-            self.k = self.kernel.eval(self.train_inputs)
-
-        x = (
-            self.k
-            + np.identity(self.kernel.output_dims * self.train_inputs.shape[0]) * 1e-10
-        )
-        self.cho = sla.cholesky(x.squeeze())
-
-    def cho_add_column(self, _):
-        raise NotImplementedError
+        """Return a copy with the covariance factorized over all training data."""
+        k = self.k if self.k is not None else self.kernel.eval(self.train_inputs)
+        n_total = self.kernel.output_dims * self.train_inputs.shape[0]
+        return self.replace(k=k, cho=_cholesky(k, n_total))
 
     def predict(self, xs, var=False):
         """Return the mean value of the posterior at the provided points.
@@ -109,15 +167,13 @@ class GP:
         ), f"Expected xs to be (n, {self.kernel.input_dims}), got {xs.shape}"
 
         if self.cho is None:
-            ys = np.zeros((xs.shape[0], self.kernel.output_dims))
+            ys = jnp.zeros((xs.shape[0], self.kernel.output_dims))
             if var:
-                css = self.kernel.eval(xs, xs)
-                return (ys, css)
-            else:
-                return ys
+                return (ys, self.kernel.eval(xs, xs))
+            return ys
 
         cov = self.kernel.eval(self.train_inputs, xs)
-        ps = sla.cho_solve((self.cho.T, True), cov).T
+        ps = jsla.cho_solve((self.cho.T, True), cov).T
         ys = (ps @ self.train_outputs.flatten()).reshape(
             (xs.shape[0], self.kernel.output_dims)
         )
@@ -130,6 +186,7 @@ class GP:
 
     def predict_original(self, xs, var=False):
         """Return the mean value of the original posterior of a linearly transformed GP at the provided points.
+
         Parameters
         ----------
             xs: (n x self.kernel.input_dims) ndarray, points
@@ -139,8 +196,8 @@ class GP:
 
         Returns
         -------
-            ys: (n x self.kernel.output_dims) ndarray the evaluated points of the posterior,
-            vs: optionally, the (n * self.kernel.output_dims x n * self.kernel.output_dims) ndarray of variances at each point.
+            ys: (n x self.kernel.prior.output_dims) ndarray the evaluated points of the posterior,
+            vs: optionally, the ndarray of variances at each point.
         """
         assert isinstance(self.kernel, LinearTransformation), (
             f"Expected a LinearTransformation kernel, not a {type(self.kernel).__name__}"
@@ -151,18 +208,16 @@ class GP:
         ), f"Expected xs to be (n, {self.kernel.input_dims}), got {xs.shape}"
 
         if self.cho is None:
-            ys = np.zeros((xs.shape[0], self.kernel.prior.output_dims))
+            ys = jnp.zeros((xs.shape[0], self.kernel.prior.output_dims))
             if var:
-                css = self.kernel.eval(xs, xs)
-                return (ys, css)
-            else:
-                return ys
+                return (ys, self.kernel.eval(xs, xs))
+            return ys
 
         # Posteriors have the form A k' K^-1 ...
 
         # Get the left product
         semi_k_star = self.kernel.semi_left_eval(self.train_inputs, xs)
-        ps = sla.cho_solve((self.cho.T, True), semi_k_star).T
+        ps = jsla.cho_solve((self.cho.T, True), semi_k_star).T
         ys = (ps @ self.train_outputs.flatten()).reshape(
             (xs.shape[0], self.kernel.prior.output_dims)
         )
@@ -173,208 +228,154 @@ class GP:
 
         return ys
 
-    def sample(self, xs: NDArray) -> NDArray:
+    def sample(self, key, xs):
         """Draw a sample from the posterior distribution.
 
         This is an expensive function for many points, use Stationary.sample_prior if possible.
 
         Parameters
         ----------
-        xs : NDArray (n, input_dims)
+        key : jax.Array
+            A ``jax.random`` PRNG key.
+        xs : Array (n, input_dims)
             The points at which to sample.
 
         Returns
         -------
-        NDArray (n, output_dims)
+        Array (n, output_dims)
             Values of f(x) of random sample from the posterior evaluated at each x in xs.
-
         """
         mean, var = self.predict(xs, var=True)
-        res = np.random.multivariate_normal(mean.flatten(), var)
+        res = _sample_gaussian(key, mean.flatten(), var)
         return res.reshape((xs.shape[0], self.kernel.output_dims))
 
     def variance(self, xs):
+        """Posterior covariance at ``xs``, ignoring the mean."""
         cov = self.kernel.eval(xs, self.train_inputs)
-        ps = sla.cho_solve(self.cho, cov.T)
+        ps = jsla.cho_solve((self.cho.T, True), cov.T)
         return cov @ ps
 
-    def optimize(self):
-        self.kernel.optimize(self.train_inputs, self.train_outputs)
+    def optimize(self, **kwargs):
+        """Fit the kernel's hyperparameters to the training data and refit.
+
+        Returns a *new* model; see :func:`ggpy.optimize.optimize` for the options.
+        """
+        kernel = self.kernel.optimize(self.train_inputs, self.train_outputs, **kwargs)
+        return self.replace(kernel=kernel, k=None, cho=None).fit()
+
+    def get_line(self):
+        """Recover the linear coefficient implied by the posterior."""
+        assert self.cho is not None
+        ps = jsla.cho_solve((self.cho.T, True), self.train_inputs).T
+        return ps @ self.train_outputs
 
     def get_D(self):
-        import matplotlib.pyplot as plt
+        """Recover the 6x6 D matrix and its per-entry variance.
 
-        if isinstance(self.kernel, LinearTransformation):
-            priors, u = self.predict_original(self.train_inputs, var=True)
-
-            x = self.train_inputs[:, 0].copy()
-            o = x.argsort()
-            x = x[o]
-
-            dp = u.diagonal().reshape(priors.shape)
-            y = priors[o, 0]
-            v = dp[o, 0]
-
-            plt.plot(x, y, marker=".")
-            plt.fill_between(x, y - v, y + v, alpha=0.5)
-            plt.plot(x, self.train_outputs[o, 0], marker=".")
-            plt.show()
-
-            kern = self.kernel.prior.kernels[0]
-            # print(kern)
-            gp = GP(kern, None)
-
-            # Add data to the GP
-            xs = self.train_inputs[:, :6]
-            ys = priors[:, :6]
-            # print(xs.shape, ys.shape)
-            gp.add_points(xs, ys, fit=True)
-
-            return gp.get_D()
+        Supported for the :class:`~ggpy.kernel.SmallDMatrix` and
+        :class:`~ggpy.kernel.NaiveDMatrix` kernels. For the diagonal
+        :class:`~ggpy.kernel.DMatrix` kernel use :meth:`MultiGP.get_D`.
+        """
+        assert self.cho is not None
+        n = self.train_inputs.shape[0]
 
         if isinstance(self.kernel, SmallDMatrix):
-            assert self.cho is not None
-
-            # Be lazy and just make another GP to get D but using the data this GP thinks belong to the D term.
-            n = self.train_inputs.shape[0]
-
+            # Be lazy and just project the data this GP thinks belongs to the D term.
             a = self.train_inputs[:, 2::2]
             b = self.train_inputs[:, 1::2]
 
-            k_star = np.zeros((6 * n, 14))
-            k_star[::6, 0] = self.train_inputs[:, 0]
-            k_star[1::6, 1:4] = b
-            k_star[2::6, 4:6] = a
-            k_star[3::6, 6:9] = b
-            k_star[4::6, 9:11] = a
-            k_star[5::6, 11:14] = b
+            k_star = jnp.zeros((6 * n, 14))
+            k_star = k_star.at[::6, 0].set(self.train_inputs[:, 0])
+            k_star = k_star.at[1::6, 1:4].set(b)
+            k_star = k_star.at[2::6, 4:6].set(a)
+            k_star = k_star.at[3::6, 6:9].set(b)
+            k_star = k_star.at[4::6, 9:11].set(a)
+            k_star = k_star.at[5::6, 11:14].set(b)
             k_star = k_star @ self.kernel.prior_unc
 
-            prod = sla.cho_solve((self.cho.T, True), k_star).T
+            prod = jsla.cho_solve((self.cho.T, True), k_star).T
 
             y = prod @ self.train_outputs.flatten()
             v = self.kernel.prior_unc - prod @ k_star
 
             # Turn y into the right form for D
-            pattern = np.zeros((6, 6), dtype=bool)
-            pattern[0, 0] = True
-            pattern[2::2, 2::2] = True
-            pattern[1::2, 1::2] = True
-            pattern = np.nonzero(pattern)
-
-            d = np.zeros((6, 6))
-            d[pattern] = y
-            dv = np.zeros_like(d)
-            dv[pattern] = v.diagonal()
+            pattern = jnp.zeros((6, 6), dtype=bool)
+            pattern = pattern.at[0, 0].set(True)
+            pattern = pattern.at[2::2, 2::2].set(True)
+            pattern = pattern.at[1::2, 1::2].set(True)
 
         elif isinstance(self.kernel, NaiveDMatrix):
-            assert self.cho is not None
+            ns = jnp.zeros((2, 6, n))
+            ns = ns.at[0, :3].set(self.train_inputs[:, ::2].T)
+            ns = ns.at[1, 3:].set(self.train_inputs[:, 1::2].T)
+            single = jnp.kron(jnp.eye(3)[:, :, None], ns)
 
-            # Be lazy and just make another GP to get D but using the data this GP thinks belong to the D term.
-            n = self.train_inputs.shape[0]
+            k_star = jnp.zeros((6 * n, 18))
+            for i in range(6):
+                k_star = k_star.at[i::6].set(single[i].T)
+            k_star = k_star * self.kernel.scale
 
-            ns = np.zeros((2, 6, n))
-            ns[0, :3] = self.train_inputs[:, ::2].T
-            ns[1, 3:] = self.train_inputs[:, 1::2].T
-            single = np.kron(np.eye(3)[:, :, None], ns)
-
-            k_star = np.zeros((6 * n, 18))
-            k_star[::6] = single[0].T
-            k_star[1::6] = single[1].T
-            k_star[2::6] = single[2].T
-            k_star[3::6] = single[3].T
-            k_star[4::6] = single[4].T
-            k_star[5::6] = single[5].T
-            k_star *= self.kernel.scale
-
-            prod = sla.cho_solve((self.cho.T, True), k_star).T
+            prod = jsla.cho_solve((self.cho.T, True), k_star).T
 
             y = prod @ self.train_outputs.flatten()
-            v = np.identity(18) * self.kernel.scale - prod @ k_star
+            v = jnp.identity(18) * self.kernel.scale - prod @ k_star
 
             # Turn y into the right form for D
-            pattern = np.zeros((6, 6), dtype=bool)
-            pattern[::2, ::2] = True
-            pattern[1::2, 1::2] = True
-            pattern = np.nonzero(pattern)
+            pattern = jnp.zeros((6, 6), dtype=bool)
+            pattern = pattern.at[::2, ::2].set(True)
+            pattern = pattern.at[1::2, 1::2].set(True)
 
-            d = np.zeros((6, 6))
-            d[pattern] = y
-            dv = np.zeros_like(d)
-            dv[pattern] = v.diagonal()
         else:
-            raise Exception(f"Expected a DMatrix kernel, got {self.kernel}")
+            raise TypeError(f"Expected a DMatrix kernel, got {self.kernel}")
+
+        idx = jnp.nonzero(pattern)
+        d = jnp.zeros((6, 6)).at[idx].set(y)
+        dv = jnp.zeros((6, 6)).at[idx].set(jnp.diagonal(v))
 
         return d, dv
 
-        # def get_D(self):
-        #     # assert isinstance(self.kernel, NaiveDMatrix), "Not a D Matrix kernel"
-        #     # I don't know see the derivation
-        #     n = self.train_inputs.shape[0]
-        #
-        #     ns = np.zeros((2, 6, n))
-        #     ns[0, :3] = self.train_inputs[:, ::2].T
-        #     ns[1, 3:] = self.train_inputs[:, 1::2].T
-        #     single = np.kron(np.eye(3)[:, :, None], ns)
-        #
-        #     k_star = np.zeros((6 * n, 18))
-        #     k_star[::6] = single[0].T
-        #     k_star[1::6] = single[1].T
-        #     k_star[2::6] = single[2].T
-        #     k_star[3::6] = single[3].T
-        #     k_star[4::6] = single[4].T
-        #     k_star[5::6] = single[5].T
-        #
-        #
-        #     # Cheating see derivation by assuming white noise
-        #     noise = np.eye(6 * self.train_inputs.shape[0]) + self.kernel.noise
-        #     k = np.eye(18)
-        #
-        #     m = noise.shape[0] + 18
-        #     sig = np.zeros((m, m))
-        #     sig[:-18, :-18] = noise
-        #     sig[-18:, -18:] = k
-        #
-        #     # weight = k_star.T @ k_star / (1.0 + self.kernel.noise)
-        #     aug_kstar = np.concatenate([k_star, np.eye(18)])
-        #     lp = np.linalg.lstsq(sig.T, aug_kstar)[0].T
-        #
-        #     aug_outputs = np.zeros(lp.shape[1])
-        #     aug_outputs[: 6 * n] = self.train_outputs.flatten()
-        #     ghat = np.linalg.pinv(lp @ aug_kstar) @ lp @ aug_outputs
-        #
-        #     pattern = np.zeros((6, 6), dtype=bool)
-        #     pattern[::2, ::2] = True
-        #     pattern[1::2, 1::2] = True
-        #
-        #     d = np.zeros(pattern.shape)
-        #     d[pattern] = ghat
-        #
-        #     return d
 
-    def get_line(self):
-        assert self.cho is not None
-        ps = sla.cho_solve((self.cho.T, True), self.train_inputs).T
-        return ps @ self.train_outputs
+@partial(jax.jit, static_argnames=("var",))
+def _multi_predict(chos, k_star, kss, outputs, var):
+    """Per-output-dimension posterior mean and, optionally, covariance.
+
+    ``chos`` is ``(output_dims, n, n)``; every array carries the output dimension on
+    its leading axis, so one ``vmap`` covers what used to be a Python loop. ``var`` is
+    static so the second triangular solve is not traced when it is not wanted.
+    """
+
+    def inner(cho, ks, kv, y):
+        mean = ks @ jsla.cho_solve((cho, False), y)
+        if not var:
+            return mean, None
+        pss = jsla.cho_solve((cho, False), ks.T)
+        return mean, kv - ks @ pss
+
+    # kss is None when var is False; don't try to map over it.
+    in_axes = (0, 0, 0 if var else None, 0)
+    return jax.vmap(inner, in_axes=in_axes)(chos, k_star, kss, outputs.T)
 
 
+@pytree_dataclass(init=False)
 class MultiGP(GP):
     """A Gaussian Process class for handling the special case where the kernel is diagonal.
 
     This reduces computational overhead by a factor of the number of output dimensions, cubed.
     By treating each output dimension independently, we can perform much more efficient calculations.
+
+    ``cho`` and ``k`` hold ``(output_dims, n, n)`` stacks -- one factorization per
+    output dimension -- and every operation is a ``vmap`` over that leading axis.
     """
 
-    kernel: DiagKernel
-    chos: list  # list of cholesky decomps for each output dimension
-    ks: list  # kernels for each output dimension
-    train_inputs: NDArray
-    train_outputs: NDArray
+    @property
+    def chos(self):
+        """The per-output-dimension Cholesky factors, stacked."""
+        return self.cho
 
-    def __init__(self, kernel, input_noise):
-        super().__init__(kernel, input_noise)
-        self.chos = []
-        self.ks = []
+    @property
+    def ks(self):
+        """The per-output-dimension covariance matrices, stacked."""
+        return self.k
 
     def add_points(self, x, y, fit=False):
         """Add new training points to the GP.
@@ -387,78 +388,38 @@ class MultiGP(GP):
             x: (n x input_dims) array of input points
             y: (n x output_dims) array of corresponding outputs
             fit: bool, whether to update the model fit after adding points
+
+        Returns
+        -------
+            A new model. The receiver is left unchanged.
         """
         new_x = x.reshape((-1, self.kernel.input_dims))
         new_y = y.reshape((-1, self.kernel.output_dims))
 
-        if fit:
-            # Initialize kernel matrices if needed
-            if not self.ks and self.train_inputs.shape[0] != 0:
-                # Get kernel evaluations for each output dimension
-                kernel_evals = self.kernel.eval(self.train_inputs)
-                n = self.train_inputs.shape[0]
-                for i in range(self.kernel.output_dims):
-                    self.ks.append(kernel_evals[i] + np.eye(n) * 1e-10)
+        if not fit:
+            return self._with_data(new_x, new_y)
 
-            if not self.chos:
-                # First fit - just add the points and do a full fit
-                self.train_inputs = np.vstack((self.train_inputs, new_x))
-                self.train_outputs = np.vstack((self.train_outputs, new_y))
-                self.fit()
-                return
-            else:
-                # Update each dimension's kernel and Cholesky decomposition
-                old_size = self.train_inputs.shape[0]
-                new_size = old_size + new_x.shape[0]
+        model = self
+        if model.k is None and model.train_inputs.shape[0] != 0:
+            n = model.train_inputs.shape[0]
+            model = model.replace(
+                k=model.kernel.eval(model.train_inputs) + jnp.eye(n) * JITTER
+            )
 
-                # Get kernel evaluations for the new points
-                kernel_evals = self.kernel.eval(
-                    self.train_inputs, new_x
-                )  # output_dims x old_size x new_points
-                kernel_new_new = self.kernel.eval(
-                    new_x
-                )  # output_dims x new_points x new_points
+        if model.cho is None:
+            # First fit - just add the points and do a full fit
+            return model._with_data(new_x, new_y).fit()
 
-                # For each output dimension, update kernel matrix and Cholesky factor
-                for i in range(self.kernel.output_dims):
-                    # Get old kernel matrix and create new larger one
-                    old_k = self.ks[i]
-                    new_k = np.empty((new_size, new_size))
-                    new_k[:old_size, :old_size] = old_k
+        # Update each dimension's kernel and Cholesky decomposition
+        k_old_new = model.kernel.eval(model.train_inputs, new_x)
+        k_new_new = model.kernel.eval(new_x) + jnp.eye(new_x.shape[0]) * JITTER
 
-                    # Fill in new blocks
-                    k_old_new = kernel_evals[i]
-                    new_k[:old_size, old_size:] = k_old_new
-                    new_k[old_size:, :old_size] = k_old_new.T
-                    new_k[old_size:, old_size:] = (
-                        kernel_new_new[i] + np.eye(new_x.shape[0]) * 1e-10
-                    )
-
-                    # Update Cholesky factor using block structure
-                    old_cho = self.chos[i]
-                    new_cho = np.zeros((new_size, new_size))
-                    new_cho[:old_size, :old_size] = old_cho
-
-                    # Compute new components
-                    new_cho[:old_size, old_size:] = sla.solve_triangular(
-                        old_cho.T, k_old_new, lower=True
-                    )
-
-                    # Schur complement
-                    schur = (
-                        new_k[old_size:, old_size:]
-                        - new_cho[:old_size, old_size:].T
-                        @ new_cho[:old_size, old_size:]
-                    )
-                    new_cho[old_size:, old_size:] = sla.cholesky(schur)
-
-                    # Store updated matrices
-                    self.ks[i] = new_k
-                    self.chos[i] = new_cho
-
-        # Always update the training data
-        self.train_inputs = np.vstack((self.train_inputs, new_x))
-        self.train_outputs = np.vstack((self.train_outputs, new_y))
+        return model._with_data(
+            new_x,
+            new_y,
+            k=jax.vmap(_extend_kernel)(model.k, k_old_new, k_new_new),
+            cho=jax.vmap(_extend_cholesky)(model.cho, k_old_new, k_new_new),
+        )
 
     def fit(self):
         """Fit the GP model using the current training data.
@@ -466,29 +427,15 @@ class MultiGP(GP):
         For a diagonal kernel, we fit each output dimension independently.
         """
         if not self.train_inputs.shape[0]:
-            return
+            return self
 
-        # Clear existing kernel matrices and Cholesky factors
-        self.ks = []
-        self.chos = []
-
-        # Get kernel evaluations for each output dimension
-        kernel_evals = self.kernel.eval(self.train_inputs)
-
-        # For each output dimension, compute Cholesky factor
         n = self.train_inputs.shape[0]
-        for i in range(self.kernel.output_dims):
-            # Extract kernel for this dimension
-            k_i = kernel_evals[i]
+        # Add a small nugget for numerical stability
+        k = self.kernel.eval(self.train_inputs) + jnp.eye(n) * JITTER
 
-            # Add small nugget for numerical stability
-            k_i = k_i + np.eye(n) * 1e-10
+        return self.replace(k=k, cho=jax.vmap(jsla.cholesky)(k))
 
-            # Store kernel and compute Cholesky decomposition
-            self.ks.append(k_i)
-            self.chos.append(sla.cholesky(k_i))
-
-    def predict(self, xs, var=False) -> tuple[NDArray, NDArray | None]:
+    def predict(self, xs, var=False):
         """Return the mean value of the posterior at the provided points.
 
         For a diagonal kernel, we can predict each output dimension independently.
@@ -508,63 +455,43 @@ class MultiGP(GP):
             self.kernel.input_dims,
         ), f"Expected xs to be (n, {self.kernel.input_dims}), got {xs.shape}"
 
-        n_test = xs.shape[0]
-
-        if not self.chos:
-            ys = np.zeros((n_test, self.kernel.output_dims))
+        if self.cho is None:
+            ys = jnp.zeros((xs.shape[0], self.kernel.output_dims))
             if var:
-                vs = self.kernel.eval(xs)
-                return ys, vs
+                return ys, self.kernel.eval(xs)
             return ys, None
 
         k_star = self.kernel.eval(xs, self.train_inputs)
-        kss = self.kernel.eval(xs, xs)
+        kss = self.kernel.eval(xs, xs) if var else None
 
-        def _inner(idx):
-            ps = sla.cho_solve(
-                (self.chos[idx], False), self.train_outputs[:, idx].reshape((-1))
-            )
-            ys = (k_star[idx] @ ps).reshape((xs.shape[0]))
-            if var:
-                pss = sla.cho_solve((self.chos[idx], False), k_star[idx].T)
-                v = kss[idx] - k_star[idx] @ pss
-                return ys, v
-            return ys
-
-        res = [_inner(i) for i in range(self.kernel.output_dims)]
-        if var:
-            ys, vs = tuple(map(np.array, zip(*res)))
-        else:
-            ys, vs = np.array(res), None
+        ys, vs = _multi_predict(self.cho, k_star, kss, self.train_outputs, var)
 
         return ys.T, vs
 
-    def sample(self, xs: NDArray) -> NDArray:
+    def sample(self, key, xs):
         """Draw a sample from the posterior distribution.
 
         For a diagonal kernel, we can sample each output dimension independently.
 
         Parameters
         ----------
-        xs : NDArray (n, input_dims)
+        key : jax.Array
+            A ``jax.random`` PRNG key.
+        xs : Array (n, input_dims)
             The points at which to sample.
 
         Returns
         -------
-        NDArray (n, output_dims)
+        Array (n, output_dims)
             Values of f(x) of random sample from the posterior evaluated at each x in xs.
         """
-        means, vars = self.predict(xs, var=True)
-        assert vars is not None
+        means, variances = self.predict(xs, var=True)
+        assert variances is not None
 
-        n_test = xs.shape[0]
-        samples = np.zeros((n_test, self.kernel.output_dims))
-        for i in range(self.kernel.output_dims):
-            samples[:, i] = np.random.multivariate_normal(
-                means[:, i].flatten(), vars[i]
-            )
+        keys = jax.random.split(key, self.kernel.output_dims)
+        samples = jax.vmap(_sample_gaussian)(keys, means.T, variances)
 
-        return samples
+        return samples.T
 
     def variance(self, xs):
         """Return the variance/uncertainty at the provided points.
@@ -573,48 +500,13 @@ class MultiGP(GP):
 
         Parameters
         ----------
-        xs : NDArray (n, input_dims)
+        xs : Array (n, input_dims)
             The points at which to evaluate variance.
 
         Returns
         -------
-        NDArray (n, output_dims)
-            Variance of the posterior at each point.
+        Array (output_dims, n, n)
+            Posterior covariance for each output dimension.
         """
         _, var = self.predict(xs, var=True)
         return var
-
-    def optimize(self):
-        """Optimize the kernel hyperparameters using the training data."""
-        self.kernel.optimize(self.train_inputs, self.train_outputs)
-        # After optimizing hyperparameters, we need to refit the model
-        self.fit()
-
-    def get_D(self):
-        assert isinstance(self.kernel, DMatrix), "Not a D Matrix kernel"
-
-        n = self.train_inputs.shape[0]
-
-        ns = np.zeros((2, 6, n))
-        ns[0, :3] = self.train_inputs[:, ::2].T
-        ns[1, 3:] = self.train_inputs[:, 1::2].T
-        k_star = np.kron(np.eye(3)[:, :, None], ns)
-
-        def _inner(idx):
-            prod = sla.cho_solve((self.chos[idx].T, True), k_star[idx].T).T
-
-            ys = prod @ self.train_outputs[:, idx]
-
-            v = np.identity(18) - prod @ k_star[idx].T
-            return ys, v
-
-        res = [_inner(i) for i in range(self.kernel.output_dims)]
-        ys, vs = tuple(map(np.array, zip(*res)))
-        ys = ys.sum(axis=0)
-        vs = vs.mean(axis=0)
-
-        # Turn y into the right form for D
-        d = np.zeros(36)
-        d[::2] = ys
-
-        return d.reshape((6, 6)), vs.diagonal()
