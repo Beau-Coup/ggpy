@@ -1,10 +1,13 @@
 """Numerical parity against the pre-JAX NumPy/SciPy implementation.
 
 ``tests/reference.npz`` holds golden outputs captured from the original NumPy code
-(regenerate with ``python tests/gen_reference.py``). These tests assert the JAX port
-reproduces them, which is what catches transcription slips in the rewritten
+(see ``tests/gen_reference.py`` for how they were produced). These tests assert the
+JAX port reproduces them, which is what catches transcription slips in the rewritten
 ``.at[].set()`` scatters and index arithmetic -- errors the behavioral tests would
 not notice.
+
+The fixture is a frozen baseline, not something to regenerate: the NumPy
+implementation it came from no longer exists in the tree.
 """
 
 from pathlib import Path
@@ -13,22 +16,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from ggpy import (
-    GP,
-    RBF,
-    DMatrix,
-    MultiGP,
-    MultiKernel,
-    NaiveDMatrix,
-    RevLinear,
-    SmallDMatrix,
-    fourier,
-)
+from ggpy import GP, RBF, MultiKernel, RevLinear, fourier
 
 REFERENCE = Path(__file__).parent / "reference.npz"
 
-# Cholesky factors and posterior variances of the D-matrix kernels involve entries
-# spanning ~1e7, so compare on a relative footing rather than a fixed absolute one.
+# Compare on a relative footing: covariance entries and Cholesky factors here span
+# several orders of magnitude.
 RTOL = 1e-7
 ATOL = 1e-7
 
@@ -36,7 +29,7 @@ ATOL = 1e-7
 @pytest.fixture(scope="module")
 def ref():
     assert REFERENCE.exists(), (
-        f"{REFERENCE} is missing; regenerate it with `python tests/gen_reference.py`"
+        f"{REFERENCE} is missing; it is a checked-in fixture and cannot be regenerated"
     )
     return np.load(REFERENCE)
 
@@ -58,13 +51,9 @@ def test_kernel_eval_parity(ref):
     x1_1d, x2_1d = ref["in_x1_1d"], ref["in_x2_1d"]
     x1_2d, x2_2d = ref["in_x1_2d"], ref["in_x2_2d"]
     x1_4d, x2_4d = ref["in_x1_4d"], ref["in_x2_4d"]
-    x1_6d, x2_6d = ref["in_x1_6d"], ref["in_x2_6d"]
 
     rbf = RBF(2, 0.1, 2.0, 1.5)
     rev = RevLinear(0.01)
-    dm = DMatrix(1e-3)
-    ndm = NaiveDMatrix(1e-3, scale=0.7)
-    sdm = SmallDMatrix(1e-3, 2.0)
     mk = MultiKernel(RBF(2, 1e-2, 2.0, 1.0), RBF(2, 1e-3, 1.0, 0.8))
     lt = mk.transform(jnp.array([[1.0, 0.5], [0.25, -1.0], [0.0, 2.0]]), 0.01)
 
@@ -77,15 +66,6 @@ def test_kernel_eval_parity(ref):
         "rev_cross": rev.eval(x1_1d, x2_1d),
         "rev_self": rev.eval(x1_1d),
         "rev_grad": rev.gradient(x1_1d, x2_1d),
-        "dmatrix_cross": dm.eval(x1_6d, x2_6d),
-        "dmatrix_self": dm.eval(x1_6d),
-        "dmatrix_grad": dm.gradient(x1_6d, x2_6d),
-        "naive_cross": ndm.eval(x1_6d, x2_6d),
-        "naive_self": ndm.eval(x1_6d),
-        "naive_grad": ndm.gradient(x1_6d, x2_6d),
-        "small_cross": sdm.eval(x1_6d, x2_6d),
-        "small_self": sdm.eval(x1_6d),
-        "small_grad": sdm.gradient(x1_6d, x2_6d),
         "multi_cross": mk.eval(x1_4d, x2_4d),
         "multi_self": mk.eval(x1_4d),
         "multi_noise": mk.noise,
@@ -101,23 +81,18 @@ def test_kernel_eval_parity(ref):
 def test_likelihood_parity(ref):
     """The NLL matches, now returned as a scalar rather than a (1, 1) array."""
     rbf = RBF(2, 0.1, 2.0, 1.5)
-    dm = DMatrix(1e-3)
 
     got = rbf.neg_log_likelihood(ref["in_x1_2d"], ref["in_y_rbf"])
     assert np.ndim(got) == 0, "neg_log_likelihood should return a scalar"
     check(got, np.squeeze(ref["rbf_likelihood"]), "rbf_likelihood")
 
-    got = dm.neg_log_likelihood(ref["in_x1_6d"], ref["in_y_diag"])
-    check(got, np.squeeze(ref["dmatrix_likelihood"]), "dmatrix_likelihood")
-
 
 def test_gp_parity(ref):
-    """GP fit, predict, incremental update and D-matrix recovery all match."""
+    """GP fit, predict and incremental update all match."""
     x1_1d = ref["in_x1_1d"]
     x1_2d, x2_2d = ref["in_x1_2d"], ref["in_x2_2d"]
     x1_4d, x2_4d = ref["in_x1_4d"], ref["in_x2_4d"]
-    x1_6d = ref["in_x1_6d"]
-    y_train, y_lt, y_naive = ref["in_y_train"], ref["in_y_lt"], ref["in_y_naive"]
+    y_train, y_lt = ref["in_y_train"], ref["in_y_lt"]
 
     def rbf():
         return RBF(2, 0.1, 2.0, 1.5)
@@ -152,36 +127,6 @@ def test_gp_parity(ref):
     gp_rev = GP(RevLinear(1e-2)).add_points(x1_1d, 1.3 * x1_1d, fit=True)
     check(gp_rev.cho, ref["gp_rev_cho"], "gp_rev_cho")
     check(gp_rev.get_line(), ref["gp_rev_line"], "gp_rev_line")
-
-    gp_naive = GP(NaiveDMatrix(1e-6)).add_points(x1_6d, y_naive, fit=True)
-    d, dv = gp_naive.get_D()
-    check(d, ref["gp_naive_D"], "gp_naive_D")
-    check(dv, ref["gp_naive_Dvar"], "gp_naive_Dvar")
-
-    gp_small = GP(SmallDMatrix(1e-6, 1.0)).add_points(x1_6d, y_naive, fit=True)
-    d, dv = gp_small.get_D()
-    check(d, ref["gp_small_D"], "gp_small_D")
-    check(dv, ref["gp_small_Dvar"], "gp_small_Dvar")
-
-
-def test_multigp_parity(ref):
-    """MultiGP's vmapped per-dimension work matches the old Python loop."""
-    x1_6d, x2_6d, y_diag = ref["in_x1_6d"], ref["in_x2_6d"], ref["in_y_diag"]
-
-    mgp = MultiGP(DMatrix(1e-6)).add_points(x1_6d, y_diag, fit=True)
-    check(mgp.chos, ref["mgp_chos"], "mgp_chos")
-
-    mean, var = mgp.predict(x2_6d, var=True)
-    check(mean, ref["mgp_mean"], "mgp_mean")
-    check(var, ref["mgp_var"], "mgp_var")
-
-    d, dv = mgp.get_D()
-    check(d, ref["mgp_D"], "mgp_D")
-    check(dv, ref["mgp_Dvar"], "mgp_Dvar")
-
-    inc = MultiGP(DMatrix(1e-6)).add_points(x1_6d[:-3], y_diag[:-3], fit=True)
-    inc = inc.add_points(x1_6d[-3:], y_diag[-3:], fit=True)
-    check(inc.chos, ref["mgp_chos_incremental"], "mgp_chos_incremental")
 
 
 def test_fourier_parity(ref):

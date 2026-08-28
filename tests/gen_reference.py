@@ -1,11 +1,17 @@
-"""Generate ``tests/reference.npz``: golden outputs from the pre-JAX NumPy implementation.
+"""How ``tests/reference.npz`` was produced -- kept for provenance, NOT runnable.
 
-Run with the *NumPy* implementation checked out to (re)generate the fixture:
+The fixture holds golden outputs captured from the **pre-JAX NumPy/SciPy**
+implementation, and this script is the code that captured them. It deliberately calls
+the old API (mutating ``add_points``, ``GP(kernel, input_noise)``, ``kernel.likelihood``)
+and therefore does not run against the current JAX tree -- that is the point. The
+values are a frozen baseline; regenerating them from the JAX code would be circular.
 
-    python tests/gen_reference.py
+``tests/test_parity.py`` asserts the JAX port still reproduces every array in the
+fixture. The inputs are stored alongside the outputs so both implementations saw
+byte-identical data.
 
-``tests/test_parity.py`` asserts the JAX port reproduces every array in here. The
-inputs are stored alongside the outputs so both backends see byte-identical data.
+The D-matrix kernels this originally also covered have since been removed from the
+library, and their arrays were dropped from the fixture.
 """
 
 import sys
@@ -15,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ggpy import GP, RBF, DMatrix, MultiGP, MultiKernel, NaiveDMatrix, RevLinear, SmallDMatrix
+from ggpy import GP, RBF, MultiKernel, RevLinear
 from ggpy import fourier
 
 
@@ -33,10 +39,8 @@ def build():
     x2_2d = rng.standard_normal((4, 2))
     x1_4d = rng.standard_normal((6, 4))
     x2_4d = rng.standard_normal((4, 4))
-    x1_6d = rng.standard_normal((8, 6))
-    x2_6d = rng.standard_normal((5, 6))
     for n, v in [("x1_1d", x1_1d), ("x2_1d", x2_1d), ("x1_2d", x1_2d), ("x2_2d", x2_2d),
-                 ("x1_4d", x1_4d), ("x2_4d", x2_4d), ("x1_6d", x1_6d), ("x2_6d", x2_6d)]:
+                 ("x1_4d", x1_4d), ("x2_4d", x2_4d)]:
         rec("in_" + n, v)
 
     # ---- RBF -----------------------------------------------------------
@@ -52,24 +56,6 @@ def build():
     rec("rev_cross", rev.eval(x1_1d, x2_1d))
     rec("rev_self", rev.eval(x1_1d))
     rec("rev_grad", rev.gradient(x1_1d, x2_1d))
-
-    # ---- DMatrix (diagonal) --------------------------------------------
-    dm = DMatrix(1e-3)
-    rec("dmatrix_cross", dm.eval(x1_6d, x2_6d))
-    rec("dmatrix_self", dm.eval(x1_6d))
-    rec("dmatrix_grad", dm.gradient(x1_6d, x2_6d))
-
-    # ---- NaiveDMatrix ---------------------------------------------------
-    ndm = NaiveDMatrix(1e-3, scale=0.7)
-    rec("naive_cross", ndm.eval(x1_6d, x2_6d))
-    rec("naive_self", ndm.eval(x1_6d))
-    rec("naive_grad", ndm.gradient(x1_6d, x2_6d))
-
-    # ---- SmallDMatrix ---------------------------------------------------
-    sdm = SmallDMatrix(1e-3, 2.0)
-    rec("small_cross", sdm.eval(x1_6d, x2_6d))
-    rec("small_self", sdm.eval(x1_6d))
-    rec("small_grad", sdm.gradient(x1_6d, x2_6d))
 
     # ---- MultiKernel + LinearTransformation ------------------------------
     k1 = RBF(2, 1e-2, 2.0, 1.0)
@@ -90,10 +76,6 @@ def build():
     y_rbf = rng.standard_normal((x1_2d.shape[0], 1))
     rec("in_y_rbf", y_rbf)
     rec("rbf_likelihood", rbf.likelihood(x1_2d, y_rbf))
-
-    y_diag = rng.standard_normal((x1_6d.shape[0], 6))
-    rec("in_y_diag", y_diag)
-    rec("dmatrix_likelihood", dm.likelihood(x1_6d, y_diag))
 
     # ---- GP fit / predict -------------------------------------------------
     gp = GP(RBF(2, 0.1, 2.0, 1.5), None)
@@ -136,37 +118,6 @@ def build():
     gp_rev.add_points(x1_1d, y_rev, fit=True)
     rec("gp_rev_cho", gp_rev.cho)
     rec("gp_rev_line", gp_rev.get_line())
-
-    # ---- GP.get_D for the non-diagonal D kernels ---------------------------
-    gp_naive = GP(NaiveDMatrix(1e-6), None)
-    y_naive = rng.standard_normal((x1_6d.shape[0], 6))
-    rec("in_y_naive", y_naive)
-    gp_naive.add_points(x1_6d, y_naive, fit=True)
-    d, dv = gp_naive.get_D()
-    rec("gp_naive_D", d)
-    rec("gp_naive_Dvar", dv)
-
-    gp_small = GP(SmallDMatrix(1e-6, 1.0), None)
-    gp_small.add_points(x1_6d, y_naive, fit=True)
-    d, dv = gp_small.get_D()
-    rec("gp_small_D", d)
-    rec("gp_small_Dvar", dv)
-
-    # ---- MultiGP -------------------------------------------------------------
-    mgp = MultiGP(DMatrix(1e-6), None)
-    mgp.add_points(x1_6d, y_diag, fit=True)
-    rec("mgp_chos", np.asarray(mgp.chos))
-    m_m, v_m = mgp.predict(x2_6d, var=True)
-    rec("mgp_mean", m_m)
-    rec("mgp_var", v_m)
-    d, dv = mgp.get_D()
-    rec("mgp_D", d)
-    rec("mgp_Dvar", dv)
-
-    mgp_inc = MultiGP(DMatrix(1e-6), None)
-    mgp_inc.add_points(x1_6d[:-3], y_diag[:-3], fit=True)
-    mgp_inc.add_points(x1_6d[-3:], y_diag[-3:], fit=True)
-    rec("mgp_chos_incremental", np.asarray(mgp_inc.chos))
 
     # ---- fourier -----------------------------------------------------------
     sig = rng.standard_normal(64) + 1j * rng.standard_normal(64)

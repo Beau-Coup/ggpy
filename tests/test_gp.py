@@ -4,137 +4,84 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ggpy import GP, RBF, DMatrix, MultiGP, NaiveDMatrix
-
-# The D-matrix structure both tests recover: nonzero only where (i + j) % 2 == 0.
-PATTERN = np.zeros((6, 6), dtype=bool)
-PATTERN[0::2, 0::2] = True  # even-even
-PATTERN[1::2, 1::2] = True  # odd-odd
+from ggpy import GP, RBF, DiagRBF, MultiGP
 
 
-def test_dmatrix_kernel():
-    """Test that the DMatrix kernel correctly implements a matrix with alternating zeros.
+def test_multigp_matches_independent_gps():
+    """MultiGP must equal fitting one scalar GP per output dimension.
 
-    This test:
-    1. Creates a DMatrix kernel
-    2. Generates random input points
-    3. Evaluates the kernel
-    4. Uses least squares to recover the 6x6 matrix structure
-    5. Checks that the matrix has zeros in the right places
+    ``MultiGP`` exists purely as an optimization: for a diagonal kernel it
+    factorizes ``output_dims`` matrices of size ``n`` instead of one of size
+    ``n * output_dims``. The cheap path has to agree with the obvious one, which is
+    what this pins down -- mean, covariance and the Cholesky factors themselves.
     """
-    keys = jax.random.split(jax.random.key(42), 5)
+    keys = jax.random.split(jax.random.key(0), 3)
+    noise = 1e-3
+    length_scales = jnp.array([1.0, 2.0, 0.5])
+    scales = jnp.array([1.0, 0.5, 2.0])
 
-    # Create the GP to sample from
-    noise = 1e-10
-    kernel = DMatrix(noise)
-    num_samples = 100
-    x_samples = jax.random.normal(keys[0], (num_samples, 6))
+    x = jax.random.normal(keys[0], (40, 2))
+    y = jax.random.normal(keys[1], (40, 3))
+    xs = jax.random.normal(keys[2], (15, 2))
 
-    model = MultiGP(kernel)
-    samp = model.sample(keys[1], x_samples)
+    multi = MultiGP(DiagRBF(2, 3, noise, length_scales, scales))
+    multi = multi.add_points(x, y, fit=True)
+    mean, var = multi.predict(xs, var=True)
 
-    # Define a random true dmatrix
-    true_matrix = jax.random.uniform(keys[2], (6, 6))
-    true_matrix = jnp.where(PATTERN, true_matrix, 0.0)
+    assert mean.shape == (15, 3)
+    assert var.shape == (3, 15, 15)
 
-    y_samples = (true_matrix @ x_samples.T).T
-    # add noise
-    y_noise = y_samples + jax.random.normal(keys[3], y_samples.shape) * noise
+    for i in range(3):
+        single = GP(RBF(2, noise, length_scales[i], scales[i]))
+        single = single.add_points(x, y[:, i : i + 1], fit=True)
+        s_mean, s_var = single.predict(xs, var=True)
 
-    # Fit the GP
-    model = model.add_points(x_samples, y_noise, fit=True)
-
-    # Generate test points at which to back out the matrix
-    num_test = 50
-    x_test = jax.random.normal(keys[4], (num_test, 6))
-    y_pred, _ = model.predict(x_test)
-
-    # Now try to recover the matrix using least squares
-    recovered_matrix = jnp.linalg.lstsq(x_test, y_pred, rcond=None)[0].T
-
-    print(f"True: {true_matrix}")
-    fit, unc = model.get_D()
-    print(f"fit {fit}")
-    print(f"uncertainty {unc}")
-
-    # check that the recovered matrix is actually close to the real one
-    assert np.allclose(true_matrix, recovered_matrix), (
-        "Recovered matrix is not equal to the data-generating matrix"
-    )
-
-    # Now use the sample from the prior distribution and back out the matrix, checking that it has the right form
-    generated_matrix = jnp.linalg.lstsq(x_samples, samp, rcond=None)[0].T
-
-    assert (np.abs(generated_matrix[~PATTERN]) < 1e-3).all(), (
-        f"The matrix has the wrong structure, non-zeros in odd entries {generated_matrix}"
-    )
-    assert (np.abs(generated_matrix[PATTERN]) > 1e-5).all(), (
-        f"The matrix has the wrong structure, zeros in even entries {generated_matrix}"
-    )
+        assert np.allclose(multi.chos[i], single.cho), (
+            f"output dim {i}: Cholesky factor differs from the scalar GP"
+        )
+        assert np.allclose(mean[:, i], s_mean.squeeze(1)), (
+            f"output dim {i}: posterior mean differs from the scalar GP"
+        )
+        assert np.allclose(var[i], s_var), (
+            f"output dim {i}: posterior covariance differs from the scalar GP"
+        )
 
 
-def test_naive_dmatrix_kernel():
-    """Same recovery as above, but through the dense NaiveDMatrix kernel and a plain GP."""
-    keys = jax.random.split(jax.random.key(43), 4)
+def test_multigp_add_points_matches_refit():
+    """MultiGP's incremental Cholesky extension matches a full refit, per dimension."""
+    keys = jax.random.split(jax.random.key(1), 2)
+    kernel = DiagRBF(2, 3, 1e-3, jnp.array([1.0, 2.0, 0.5]))
 
-    # Create the GP to sample from
-    noise = 1e-10
-    kernel = NaiveDMatrix(noise)
-    num_samples = 100
-    x_samples = jax.random.normal(keys[0], (num_samples, 6))
+    x = jax.random.normal(keys[0], (30, 2))
+    y = jax.random.normal(keys[1], (30, 3))
 
-    model = GP(kernel)
-    samp = model.sample(keys[1], x_samples)
+    full = MultiGP(kernel).add_points(x, y, fit=True)
 
-    # A true dmatrix with entries spanning several orders of magnitude, to check
-    # the fit is well conditioned and not just recovering something near unity.
-    true_matrix = jnp.array(
-        [
-            [131029.16310579, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 653289.7, 0.0, 583323.62, 0.0, 748150.94],
-            [0.0, 0.0, 784771.94, 0.0, 2304494.2, 0.0],
-            [0.0, 583323.62, 0.0, 2021801.23904745, 0.0, -2254476.8],
-            [0.0, 0.0, 2304494.2, 0.0, 69848000.0, 0.0],
-            [0.0, 748150.94, 0.0, -2254476.8, 0.0, 53297996.8],
-        ]
-    )
+    inc = MultiGP(kernel).add_points(x[:-5], y[:-5], fit=True)
+    inc = inc.add_points(x[-5:], y[-5:], fit=True)
 
-    y_samples = (true_matrix @ x_samples.T).T
-    # add noise
-    y_noise = y_samples + jax.random.normal(keys[2], y_samples.shape) * jnp.sqrt(noise)
+    assert np.allclose(full.chos, inc.chos)
+    assert np.allclose(full.train_inputs, inc.train_inputs)
+    assert np.allclose(full.predict(x, var=False)[0], inc.predict(x, var=False)[0])
 
-    # Fit the GP
-    model = model.add_points(x_samples, y_noise, fit=True)
 
-    # Generate test points at which to back out the matrix
-    num_test = 50
-    x_test = jax.random.normal(keys[3], (num_test, 6))
-    y_pred = model.predict(x_test)
+def test_multigp_sample_recovers_its_own_statistics():
+    """Samples drawn from a diagonal prior have the per-dimension scale asked for."""
+    key = jax.random.key(2)
+    scales = jnp.array([0.25, 4.0])
+    kernel = DiagRBF(2, 2, 1e-6, jnp.array([2.0, 2.0]), scales)
 
-    # Now try to recover the matrix using least squares
-    recovered_matrix = jnp.linalg.lstsq(x_test, y_pred, rcond=None)[0].T
+    xs = jax.random.normal(key, (400, 2))
+    keys = jax.random.split(key, 200)
+    samples = jnp.stack([MultiGP(kernel).sample(k, xs) for k in keys])
 
-    fit, unc = model.get_D()
+    assert samples.shape == (200, 400, 2)
+    assert np.all(np.isfinite(samples))
 
-    # check that the recovered matrix is actually close to the real one
-    assert np.allclose(true_matrix, recovered_matrix, rtol=1e-5, atol=1e-5), (
-        f"Recovered matrix {recovered_matrix} is not equal to the data-generating matrix {true_matrix}"
-    )
-
-    assert np.allclose(true_matrix, fit, rtol=1e-5, atol=1e-5), (
-        f"Fit matrix {fit} is not equal to the data-generating matrix {true_matrix}"
-    )
-
-    # Now use the sample from the prior distribution and back out the matrix, checking that it has the right form
-    generated_matrix = jnp.linalg.lstsq(
-        x_samples, samp.reshape((num_samples, 6)), rcond=None
-    )[0].T
-
-    assert (np.abs(generated_matrix[~PATTERN]) < 1e-3).all(), (
-        f"The matrix has the wrong structure, non-zeros in odd entries {generated_matrix}"
-    )
-    assert (np.abs(generated_matrix[PATTERN]) > 1e-5).all(), (
-        f"The matrix has the wrong structure, zeros in even entries {generated_matrix}"
+    # Prior variance at any point is the kernel's scale for that output dimension.
+    empirical = samples.var(axis=(0, 1))
+    assert np.allclose(empirical, scales, rtol=0.15), (
+        f"prior sample variance {empirical} does not match the kernel scales {scales}"
     )
 
 

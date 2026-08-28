@@ -28,6 +28,7 @@ __all__ = [
     "MultiKernel",
     "LinearTransformation",
     "DiagKernel",
+    "DiagRBF",
     "Sum",
     "RevLinear",
     "kernel_eval",
@@ -577,6 +578,62 @@ class DiagKernel(Kernel):
         const = x.shape[0] * jnp.log(2 * jnp.pi)
 
         return (jnp.sum(lds) + prod + const) * 0.5
+
+
+@pytree_dataclass(init=False)
+class DiagRBF(DiagKernel):
+    """Independent squared-exponential kernels, one per output dimension.
+
+    The concrete :class:`DiagKernel` that :class:`~ggpy.gp.MultiGP` is built for.
+    Each output dimension gets its own length scale and scale, and the dimensions
+    are mutually independent -- so a ``MultiGP`` over this kernel factorizes
+    ``output_dims`` matrices of size ``n`` rather than one of size ``n * output_dims``.
+
+    ``length_scale``, ``scale`` and ``noise`` are each either a scalar (shared across
+    output dimensions) or a vector of length ``output_dims``.
+    """
+
+    TRAINABLE = ("length_scale", "scale")
+
+    noise: jax.Array
+    length_scale: jax.Array
+    scale: jax.Array
+    input_noise: jax.Array | None
+    input_dims: int = static_field()
+    output_dims: int = static_field()
+
+    def __init__(
+        self, input_dims, output_dims, noise, length_scale, scale=1.0, input_noise=None
+    ):
+        broadcast = jnp.ones(output_dims)
+        set_frozen(
+            self,
+            input_dims=input_dims,
+            output_dims=output_dims,
+            noise=jnp.asarray(noise) * broadcast,
+            length_scale=jnp.asarray(length_scale) * broadcast,
+            scale=jnp.asarray(scale) * broadcast,
+            input_noise=input_noise,
+        )
+
+    def _eval_all(self, x1, x2):
+        """Return ``(output_dims, n, m)``: the same squared distance, per-dim scaled."""
+        sq_dist = ((jnp.expand_dims(x1, 1) - x2) ** 2).sum(axis=-1)  # (n, m)
+        arg = sq_dist[None] / (self.length_scale[:, None, None] ** 2) * 0.5
+        return self.scale[:, None, None] * jnp.exp(-arg)
+
+    def gradient(self, x1, x2):
+        """Return the gradient of the covariance of (X_1, X_2) with respect to X_1
+        d/dx1 (k(x1, x2))
+
+        Returns
+        -------
+            An output_dims x n x m x input_dims tensor of evaluated gradients.
+        """
+        dx = jnp.expand_dims(x1, 1) - x2  # n x m x input_dims
+        k = self._eval_all(x1, x2)  # output_dims x n x m
+        dk = -dx[None] / self.length_scale[:, None, None, None] ** 2
+        return dk * k[..., None]
 
 
 @pytree_dataclass(init=False)

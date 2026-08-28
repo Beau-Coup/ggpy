@@ -30,11 +30,26 @@ __all__ = ["GP", "MultiGP", "JITTER"]
 JITTER = 1e-10
 
 
+def _sample_gaussian(key, mean, cov):
+    """Draw one sample from ``N(mean, cov)``, tolerating a singular ``cov``.
+
+    ``jax.random.multivariate_normal`` factorizes with Cholesky and yields NaN on the
+    marginally-indefinite posteriors a GP produces. An eigendecomposition with the
+    spectrum clipped at zero is the well-conditioned equivalent (and is what NumPy's
+    SVD-based ``multivariate_normal`` effectively does).
+    """
+    w, v = jnp.linalg.eigh(cov)
+    scale = v * jnp.sqrt(jnp.clip(w, 0.0))
+    return mean + scale @ jax.random.normal(key, mean.shape)
+
+
+@partial(jax.jit, static_argnames=("n_total",))
 def _cholesky(k, n_total):
     """Upper-triangular Cholesky factor of ``k``, regularized by :data:`JITTER`."""
     return jsla.cholesky(k + jnp.identity(n_total) * JITTER)
 
 
+@jax.jit
 def _extend_cholesky(old_cho, k_old_new, k_new_new):
     """Grow an upper Cholesky factor by a new block, without refactorizing.
 
@@ -53,6 +68,7 @@ def _extend_cholesky(old_cho, k_old_new, k_new_new):
     return cho.at[old_size:, old_size:].set(bottom_right)
 
 
+@jax.jit
 def _extend_kernel(old_k, k_old_new, k_new_new):
     """Assemble the enlarged covariance matrix from its three new blocks."""
     old_size = old_k.shape[0]
@@ -268,71 +284,6 @@ class GP:
         assert self.cho is not None
         ps = jsla.cho_solve((self.cho.T, True), self.train_inputs).T
         return ps @ self.train_outputs
-
-    def get_D(self):
-        """Recover the 6x6 D matrix and its per-entry variance.
-
-        Supported for the :class:`~ggpy.kernel.SmallDMatrix` and
-        :class:`~ggpy.kernel.NaiveDMatrix` kernels. For the diagonal
-        :class:`~ggpy.kernel.DMatrix` kernel use :meth:`MultiGP.get_D`.
-        """
-        assert self.cho is not None
-        n = self.train_inputs.shape[0]
-
-        if isinstance(self.kernel, SmallDMatrix):
-            # Be lazy and just project the data this GP thinks belongs to the D term.
-            a = self.train_inputs[:, 2::2]
-            b = self.train_inputs[:, 1::2]
-
-            k_star = jnp.zeros((6 * n, 14))
-            k_star = k_star.at[::6, 0].set(self.train_inputs[:, 0])
-            k_star = k_star.at[1::6, 1:4].set(b)
-            k_star = k_star.at[2::6, 4:6].set(a)
-            k_star = k_star.at[3::6, 6:9].set(b)
-            k_star = k_star.at[4::6, 9:11].set(a)
-            k_star = k_star.at[5::6, 11:14].set(b)
-            k_star = k_star @ self.kernel.prior_unc
-
-            prod = jsla.cho_solve((self.cho.T, True), k_star).T
-
-            y = prod @ self.train_outputs.flatten()
-            v = self.kernel.prior_unc - prod @ k_star
-
-            # Turn y into the right form for D
-            pattern = jnp.zeros((6, 6), dtype=bool)
-            pattern = pattern.at[0, 0].set(True)
-            pattern = pattern.at[2::2, 2::2].set(True)
-            pattern = pattern.at[1::2, 1::2].set(True)
-
-        elif isinstance(self.kernel, NaiveDMatrix):
-            ns = jnp.zeros((2, 6, n))
-            ns = ns.at[0, :3].set(self.train_inputs[:, ::2].T)
-            ns = ns.at[1, 3:].set(self.train_inputs[:, 1::2].T)
-            single = jnp.kron(jnp.eye(3)[:, :, None], ns)
-
-            k_star = jnp.zeros((6 * n, 18))
-            for i in range(6):
-                k_star = k_star.at[i::6].set(single[i].T)
-            k_star = k_star * self.kernel.scale
-
-            prod = jsla.cho_solve((self.cho.T, True), k_star).T
-
-            y = prod @ self.train_outputs.flatten()
-            v = jnp.identity(18) * self.kernel.scale - prod @ k_star
-
-            # Turn y into the right form for D
-            pattern = jnp.zeros((6, 6), dtype=bool)
-            pattern = pattern.at[::2, ::2].set(True)
-            pattern = pattern.at[1::2, 1::2].set(True)
-
-        else:
-            raise TypeError(f"Expected a DMatrix kernel, got {self.kernel}")
-
-        idx = jnp.nonzero(pattern)
-        d = jnp.zeros((6, 6)).at[idx].set(y)
-        dv = jnp.zeros((6, 6)).at[idx].set(jnp.diagonal(v))
-
-        return d, dv
 
 
 @partial(jax.jit, static_argnames=("var",))

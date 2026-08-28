@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from ggpy import GP, RBF, DMatrix, neg_log_likelihood, optimize
+from ggpy import GP, RBF, DiagRBF, neg_log_likelihood, optimize
 from ggpy.optimize import LOWER_FACTOR, UPPER_FACTOR
 
 
@@ -97,16 +97,18 @@ def test_optimize_recovers_the_length_scale():
 def test_diagonal_kernel_optimizes():
     """DiagKernel's per-dimension likelihood is differentiable and fittable too."""
     keys = jax.random.split(jax.random.key(5), 2)
-    x = jax.random.normal(keys[0], (40, 6))
-    y = jax.random.normal(keys[1], (40, 6))
+    x = jax.random.normal(keys[0], (40, 2))
+    y = jax.random.normal(keys[1], (40, 3))
 
-    kernel = DMatrix(0.5)
+    kernel = DiagRBF(2, 3, 1e-3, jnp.array([3.0, 3.0, 3.0]))
     before = float(neg_log_likelihood(kernel, x, y))
-    fitted = optimize(kernel, x, y, steps=100, learning_rate=0.01)
+    fitted = optimize(kernel, x, y, steps=200, learning_rate=0.02)
     after = float(neg_log_likelihood(fitted, x, y))
 
     assert after < before, f"NLL rose: {before} -> {after}"
-    assert np.all(np.isfinite(np.asarray(fitted.noise)))
+    assert np.all(np.isfinite(np.asarray(fitted.length_scale)))
+    # Each output dimension is fit independently, so they need not move together.
+    assert fitted.length_scale.shape == (3,)
 
 
 def test_optimize_rejects_kernels_without_parameters():

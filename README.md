@@ -21,6 +21,8 @@ an explicit PRNG key.
 ## Features
 - Heteroscedastic kernels
 - Augmented kernels
+- Independent multi-output GPs (`MultiGP` over a `DiagKernel` such as `DiagRBF`),
+  which factorizes one matrix per output dimension instead of one big joint matrix
 - Parameter optimization by gradient descent (autodiff through the marginal likelihood, via optax)
 - Noisy-input regression [WIP]
 
